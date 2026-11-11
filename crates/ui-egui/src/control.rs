@@ -30,6 +30,10 @@
 //! - `ui.focus`: bring the main window to the front
 //! - `app.open {path}` / `app.save {path}`: relative file I/O under the automation roots; reply with `warnings`
 //! - `app.quit`
+//! - `app.newVideoLayer {paths, fps?, name?}`: New Video Layer from File with every frame file read
+//!   under the automation read roots, in the order given; reply `{layer, frames}`
+//! - `host.events`: the clicks on the launching integration's menu (`--host-menu`) since the
+//!   last call, oldest first, as `{events: [{id, label}]}`; the queue is emptied
 //! - `jobs.list` / `jobs.cancel {job?}`: background jobs (#210) with progress; cancel one (or all).
 //!   `engine.execute`, `ui.menu.invoke` and `ui.dialog.confirm` wait for a command that runs as a
 //!   job unless `wait: false` (then the reply is `{job, pending: true}`)
@@ -184,11 +188,13 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
 mod tests;
 
 pub(super) const METHODS: &[&str] = &[
+    "app.newVideoLayer",
     "app.open",
     "app.quit",
     "app.save",
     "engine.commands",
     "engine.execute",
+    "host.events",
     "jobs.cancel",
     "jobs.list",
     "ui.click",

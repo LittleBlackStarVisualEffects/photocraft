@@ -527,6 +527,9 @@ pub struct Services {
     pub save_file: Option<SaveFileFn>,
     /// File access used only by control/MCP requests. Interactive dialogs keep
     /// using `file_dialog` and `write` with the user's authority.
+    /// The launching integration's menu after Window (`--host-menu`), with its clicks not
+    /// collected yet (`host.events`).
+    pub host_menu: Option<crate::host_menu::HostMenu>,
     pub automation_read: Option<AutomationReadFn>,
     pub automation_write: Option<AutomationWriteFn>,
     pub automation_open_pcraft: Option<AutomationOpenPcraftFn>,

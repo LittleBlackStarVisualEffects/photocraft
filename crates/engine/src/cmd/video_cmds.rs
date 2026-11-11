@@ -385,22 +385,127 @@ fn tiff_page_error(display: &std::path::Path, name: &str, page: usize, error: ph
     }
 }
 
+/// Footage being decoded: the frames kept so far, the frame delays of animated files and the
+/// storage the frames take, checked against the frame and memory limits as each frame arrives.
+struct FootageBuilder {
+    frames: Vec<Surface>,
+    delays: Vec<u32>,
+    /// Each frame stores whole tiles however little it draws, so count the tiles kept so far.
+    kept_bytes: u64,
+    max_bytes: u64,
+    /// Files added; only a lone GIF or WebP says how fast it plays.
+    files: usize,
+}
+
+impl FootageBuilder {
+    fn new() -> Self {
+        Self { frames: Vec::new(), delays: Vec::new(), kept_bytes: 0, max_bytes: footage_byte_limit(), files: 0 }
+    }
+
+    /// Keep one decoded frame, or say which limit it would pass.
+    fn keep(&mut self, surface: Surface) -> std::result::Result<(), String> {
+        // A frame of fully transparent pixels stores no tiles, so the count needs its own limit.
+        if self.frames.len() >= crate::timeline_cmds::MAX_DURATION {
+            return Err(format!("the footage has more than {} frames", crate::timeline_cmds::MAX_DURATION));
+        }
+        let tile = u64::from(photocraft_geom::TILE_SIZE.unsigned_abs()).pow(2) * surface.format().bytes_per_pixel() as u64;
+        self.kept_bytes = self.kept_bytes.saturating_add(tile.saturating_mul(surface.tile_count() as u64));
+        if self.kept_bytes > self.max_bytes {
+            return Err(format!("the footage needs more than {} MiB of frames", self.max_bytes >> 20));
+        }
+        self.frames.push(surface);
+        Ok(())
+    }
+
+    /// Decode one footage file into frames: every frame of an animated GIF or WebP, every
+    /// full-resolution page of a multi-page TIFF, else the image itself. `display` names the
+    /// file in errors and its extension picks the Targa handling; `name` is what the importers
+    /// see.
+    fn add_file(
+        &mut self,
+        display: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+        fmt: photocraft_color::PixelFormat,
+        opts: &photocraft_io::ImportOptions,
+    ) -> Result<()> {
+        self.files += 1;
+        // A GIF (a still one is its only frame) or an animated WebP brings every frame.
+        let animation = match photocraft_codecs::detect(bytes) {
+            Some(photocraft_codecs::Format::Gif) => Some(photocraft_io::import_gif_frames as ImportFrames),
+            Some(photocraft_codecs::Format::WebP) if photocraft_codecs::webp_is_animated(bytes) => Some(photocraft_io::import_webp_frames as ImportFrames),
+            _ => None,
+        };
+        if let Some(import) = animation {
+            let mut over = None;
+            let done = import(name, bytes, &mut |doc, delay_ms| {
+                if let Err(msg) = self.keep(crate::file_cmds::flattened(&doc, fmt)) {
+                    over = Some(msg);
+                    return Err(photocraft_io::IoError::Cancelled);
+                }
+                self.delays.push(delay_ms);
+                Ok(())
+            });
+            if let Some(msg) = over {
+                return Err(EngineError::Other(format!("`{}`: {msg}", display.display())));
+            }
+            done.map_err(|e| EngineError::Other(format!("`{}`: {e}", display.display())))?;
+            return Ok(());
+        }
+        // A multi-page TIFF: every full-resolution page of the main chain, in order, as the
+        // GIF's frames are (#6379). Thumbnails, reduced-resolution copies and masks are left out.
+        if photocraft_codecs::detect(bytes) == Some(photocraft_codecs::Format::Tiff) {
+            let (pages, complete) = tiff_pages(bytes);
+            if pages.len() > 1 {
+                // A damaged or looping page chain, or one past the 10,000-directory limit, lists
+                // only its first pages: refuse it rather than silently import part of the file.
+                if !complete {
+                    return Err(EngineError::Other(format!(
+                        "`{}`: only the first {} pages could be read (its page list is damaged or too long), so not every page would be imported",
+                        display.display(),
+                        pages.len()
+                    )));
+                }
+                for page in pages {
+                    // Same admission policy, caller limit and import settings as any other TIFF
+                    // page import: a multi-page TIFF is not a way around the memory budget.
+                    let doc = photocraft_io::import_tiff_page_with_options(name, bytes, Some(page), opts, &photocraft_raster::Interrupt::NONE)
+                        .map_err(|e| tiff_page_error(display, name, page, e))?
+                        .document;
+                    // The page is flattened before admission of the next one, so the retained
+                    // frames of every page count against the footage limit, as GIF and WebP
+                    // frames do.
+                    self.keep(crate::file_cmds::flattened(&doc, fmt)).map_err(|msg| EngineError::Other(format!("`{}`: {msg}", display.display())))?;
+                }
+                return Ok(());
+            }
+        }
+        let mut doc = crate::file_cmds::import_with_options(name, bytes, opts)?;
+        // A Targa's alpha opens as a channel (as in Photoshop); a frame's alpha is transparency.
+        if display.extension().is_some_and(|e| e.eq_ignore_ascii_case("tga")) {
+            photocraft_io::tga_alpha_channel_to_transparency(&mut doc);
+        }
+        self.keep(crate::file_cmds::flattened_checked(&doc, fmt, "layer.videoLayers.newVideoLayerFromFile")?)
+            .map_err(|msg| EngineError::Other(format!("`{}`: {msg}", display.display())))
+    }
+
+    fn finish(self) -> Footage {
+        // Only a lone GIF or WebP says how fast it plays; a sequence mixing files has no single rate.
+        let fps = if self.files == 1 { fps_from_delays(&self.delays) } else { None };
+        Footage { frames: self.frames, fps }
+    }
+}
+
 /// Load frames from `path`: a single image (1 frame, or every frame of an animated GIF or WebP), or a
 /// directory of images (sorted = an image sequence). Each becomes a full raster frame in the
 /// document's format.
 fn load_frames(path: &str, fmt: photocraft_color::PixelFormat, opts: &photocraft_io::ImportOptions) -> Result<Footage> {
     let p = std::path::Path::new(path);
-    let is_img = |f: &std::path::Path| {
-        matches!(
-            f.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-            Some("png" | "jpg" | "jpeg" | "tif" | "tiff" | "webp" | "bmp" | "gif" | "tga" | "exr" | "pcraft" | "psd")
-        )
-    };
     let files: Vec<std::path::PathBuf> = if p.is_dir() {
         let mut v: Vec<_> = std::fs::read_dir(p)
             .map_err(|e| EngineError::Other(format!("read dir `{path}`: {e}")))?
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|f| is_img(f))
+            .filter(|f| is_footage_image(f))
             .collect();
         v.sort();
         v
@@ -410,100 +515,29 @@ fn load_frames(path: &str, fmt: photocraft_color::PixelFormat, opts: &photocraft
     if files.is_empty() {
         return Err(EngineError::Other(format!("no images in `{path}`")));
     }
-    let mut frames: Vec<Surface> = Vec::with_capacity(files.len());
-    let mut delays = Vec::new();
-    // Each frame stores whole tiles however little it draws, so count the tiles kept so far.
-    let mut kept_bytes = 0u64;
-    let max_footage_bytes = footage_byte_limit();
-    let mut keep = |frames: &mut Vec<Surface>, surface: Surface| -> std::result::Result<(), String> {
-        // A frame of fully transparent pixels stores no tiles, so the count needs its own limit.
-        if frames.len() >= crate::timeline_cmds::MAX_DURATION {
-            return Err(format!("the footage has more than {} frames", crate::timeline_cmds::MAX_DURATION));
-        }
-        let tile = u64::from(photocraft_geom::TILE_SIZE.unsigned_abs()).pow(2) * surface.format().bytes_per_pixel() as u64;
-        kept_bytes = kept_bytes.saturating_add(tile.saturating_mul(surface.tile_count() as u64));
-        if kept_bytes > max_footage_bytes {
-            return Err(format!("the footage needs more than {} MiB of frames", max_footage_bytes >> 20));
-        }
-        frames.push(surface);
-        Ok(())
-    };
+    let mut footage = FootageBuilder::new();
     for f in &files {
         let bytes = std::fs::read(f).map_err(|e| EngineError::Other(format!("read `{}`: {e}", f.display())))?;
-        let name = f.to_string_lossy();
-        // A GIF (a still one is its only frame) or an animated WebP brings every frame.
-        let animation = match photocraft_codecs::detect(&bytes) {
-            Some(photocraft_codecs::Format::Gif) => Some(photocraft_io::import_gif_frames as ImportFrames),
-            Some(photocraft_codecs::Format::WebP) if photocraft_codecs::webp_is_animated(&bytes) => Some(photocraft_io::import_webp_frames as ImportFrames),
-            _ => None,
-        };
-        if let Some(import) = animation {
-            let mut over = None;
-            let done = import(&name, &bytes, &mut |doc, delay_ms| {
-                if let Err(msg) = keep(&mut frames, crate::file_cmds::flattened(&doc, fmt)) {
-                    over = Some(msg);
-                    return Err(photocraft_io::IoError::Cancelled);
-                }
-                delays.push(delay_ms);
-                Ok(())
-            });
-            if let Some(msg) = over {
-                return Err(EngineError::Other(format!("`{}`: {msg}", f.display())));
-            }
-            done.map_err(|e| EngineError::Other(format!("`{}`: {e}", f.display())))?;
-            continue;
-        }
-        // A multi-page TIFF: every full-resolution page of the main chain, in order, as the
-        // GIF's frames are (#6379). Thumbnails, reduced-resolution copies and masks are left out.
-        if photocraft_codecs::detect(&bytes) == Some(photocraft_codecs::Format::Tiff) {
-            let (pages, complete) = tiff_pages(&bytes);
-            if pages.len() > 1 {
-                // A damaged or looping page chain, or one past the 10,000-directory limit, lists
-                // only its first pages: refuse it rather than silently import part of the file.
-                if !complete {
-                    return Err(EngineError::Other(format!(
-                        "`{}`: only the first {} pages could be read (its page list is damaged or too long), so not every page would be imported",
-                        f.display(),
-                        pages.len()
-                    )));
-                }
-                for page in pages {
-                    // Same admission policy, caller limit and import settings as any other TIFF
-                    // page import: a multi-page TIFF is not a way around the memory budget.
-                    let doc = photocraft_io::import_tiff_page_with_options(&name, &bytes, Some(page), opts, &photocraft_raster::Interrupt::NONE)
-                        .map_err(|e| tiff_page_error(f, &name, page, e))?
-                        .document;
-                    // The page is flattened before admission of the next one, so the retained
-                    // frames of every page count against the footage limit, as GIF and WebP
-                    // frames do.
-                    keep(&mut frames, crate::file_cmds::flattened(&doc, fmt)).map_err(|msg| EngineError::Other(format!("`{}`: {msg}", f.display())))?;
-                }
-                continue;
-            }
-        }
-        let mut doc = crate::file_cmds::import_with_options(&name, &bytes, opts)?;
-        // A Targa's alpha opens as a channel (as in Photoshop); a frame's alpha is transparency.
-        if f.extension().is_some_and(|e| e.eq_ignore_ascii_case("tga")) {
-            photocraft_io::tga_alpha_channel_to_transparency(&mut doc);
-        }
-        keep(&mut frames, crate::file_cmds::flattened_checked(&doc, fmt, "layer.videoLayers.newVideoLayerFromFile")?)
-            .map_err(|msg| EngineError::Other(format!("`{}`: {msg}", f.display())))?;
+        footage.add_file(f, &f.to_string_lossy(), &bytes, fmt, opts)?;
     }
-    // Only a lone GIF or WebP says how fast it plays; a sequence mixing files has no single rate.
-    let fps = if files.len() == 1 { fps_from_delays(&delays) } else { None };
-    Ok(Footage { frames, fps })
+    Ok(footage.finish())
 }
 
-fn new_from_file(s: &mut Session, p: &Value) -> Result<Value> {
-    let path = p
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| EngineError::BadParams { cmd: "layer.videoLayers.newVideoLayerFromFile".into(), msg: "need `path`".into() })?
-        .to_string();
+/// Whether a directory entry is one of the image kinds a footage folder is read for.
+fn is_footage_image(f: &std::path::Path) -> bool {
+    matches!(
+        f.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "tif" | "tiff" | "webp" | "bmp" | "gif" | "tga" | "exr" | "pcraft" | "psd")
+    )
+}
+
+/// Put loaded footage into the active document as a new video layer named after `name` above
+/// the active layer, creating or growing the timeline to hold it. `fps` (the caller's) wins,
+/// then the rate the footage implies, then 30.
+fn insert_video_layer(s: &mut Session, footage: Footage, fps: Option<f32>, name: &str, source: String) -> Result<Value> {
+    let Footage { frames, fps: footage_fps } = footage;
+    let fps = fps.or(footage_fps).unwrap_or(30.0);
     let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
-    let Footage { frames, fps: footage_fps } = load_frames(&path, fmt, &footage_import_options(s))?;
-    // An explicit `fps` wins, then the rate the footage implies, then 30.
-    let fps = crate::timeline_cmds::fps_param("layer.videoLayers.newVideoLayerFromFile", p)?.or(footage_fps).unwrap_or(30.0);
     let n = frames.len();
     let id = s.edit("New Video Layer from File", |doc, active| {
         store(doc);
@@ -512,11 +546,11 @@ fn new_from_file(s: &mut Session, p: &Value) -> Result<Value> {
         } else if let Some(t) = &mut doc.timeline {
             grow_duration(t, n);
         }
-        let name = doc.next_layer_name(std::path::Path::new(&path).file_stem().and_then(|s| s.to_str()).unwrap_or("Video"));
+        let name = doc.next_layer_name(name);
         let mut l = Layer::raster(name, fmt);
         let mut v = VideoData::new(frames, fps);
         v.original_frames = Some(v.frames.clone());
-        v.source = photocraft_doc::VideoSource::File { path: path.clone() };
+        v.source = photocraft_doc::VideoSource::File { path: source };
         // The first frame is the layer's content before it is placed: an active artboard takes
         // the layer only when its content is on the board, as `frames_to_layers` does.
         if let (Some(first), LayerContent::Raster(surf)) = (v.frames.first(), &mut l.content) {
@@ -529,6 +563,64 @@ fn new_from_file(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(id)
     })?;
     Ok(json!({"layer": id.0, "frames": n}))
+}
+
+fn new_from_file(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = p
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| EngineError::BadParams { cmd: "layer.videoLayers.newVideoLayerFromFile".into(), msg: "need `path`".into() })?
+        .to_string();
+    let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
+    let footage = load_frames(&path, fmt, &footage_import_options(s))?;
+    let fps = crate::timeline_cmds::fps_param("layer.videoLayers.newVideoLayerFromFile", p)?;
+    let name = std::path::Path::new(&path).file_stem().and_then(|s| s.to_str()).unwrap_or("Video").to_string();
+    insert_video_layer(s, footage, fps, &name, path)
+}
+
+/// The control channel's capability-scoped New Video Layer from File (`app.newVideoLayer`):
+/// `p` is `{"paths": [str, …], "fps": number?, "name": str?}`, one footage file per path in
+/// the order given (the caller sorts a sequence); an animated GIF or WebP or a multi-page TIFF
+/// brings all its frames. Every file is read with `read`, which resolves the path beneath the
+/// automation read roots, never an ambient path. Same layer, timeline and limits as
+/// `layer.videoLayers.newVideoLayerFromFile`; the reply is `{layer, frames}`.
+pub fn new_video_layer_from_reader(
+    s: &mut Session,
+    p: &Value,
+    read: &mut dyn FnMut(&str) -> std::result::Result<Vec<u8>, String>,
+) -> Result<Value> {
+    const CMD: &str = "app.newVideoLayer";
+    let bad = |msg: &str| EngineError::BadParams { cmd: CMD.into(), msg: msg.into() };
+    let list = p.get("paths").and_then(Value::as_array).ok_or_else(|| bad("need `paths`, a list of frame file paths"))?;
+    if list.is_empty() {
+        return Err(bad("`paths` is empty"));
+    }
+    if list.len() > crate::timeline_cmds::MAX_DURATION {
+        return Err(bad(&format!("`paths` lists more than {} frames", crate::timeline_cmds::MAX_DURATION)));
+    }
+    let paths = list.iter().map(|v| v.as_str().filter(|s| !s.is_empty())).collect::<Option<Vec<&str>>>().ok_or_else(|| bad("every entry of `paths` must be a non-empty string"))?;
+    let name = match p.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(n)) if !n.trim().is_empty() => Some(n.trim().to_string()),
+        Some(_) => return Err(bad("`name` must be a non-empty string")),
+    };
+    let fps = crate::timeline_cmds::fps_param(CMD, p)?;
+    let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
+    let opts = footage_import_options(s);
+    let mut footage = FootageBuilder::new();
+    for path in &paths {
+        let bytes = read(path).map_err(|e| EngineError::Other(format!("read `{path}`: {e}")))?;
+        footage.add_file(std::path::Path::new(path), path, &bytes, fmt, &opts)?;
+    }
+    let first = std::path::Path::new(paths[0]);
+    // A sequence keeps its folder as the footage source (what Replace Footage and Reload Frame
+    // read), a single file itself.
+    let source = match (paths.len(), first.parent()) {
+        (n, Some(dir)) if n > 1 && !dir.as_os_str().is_empty() => dir.to_string_lossy().into_owned(),
+        _ => paths[0].to_string(),
+    };
+    let name = name.unwrap_or_else(|| first.file_stem().and_then(|s| s.to_str()).unwrap_or("Video").to_string());
+    insert_video_layer(s, footage.finish(), fps, &name, source)
 }
 
 fn replace_footage(s: &mut Session, p: &Value) -> Result<Value> {

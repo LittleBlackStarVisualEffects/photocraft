@@ -7,6 +7,7 @@ use crate::state::DialogKind;
 
 mod bar;
 pub mod enable_rules;
+pub mod host_menu;
 mod invoke;
 mod items;
 pub mod menu_keys;
@@ -52,6 +53,27 @@ pub(crate) fn modal_allows(app: &PhotocraftApp, id: &str) -> bool {
 
 /// Top-level menus in Photoshop order.
 pub const TOP_MENUS: [&str; 10] = ["File", "Edit", "Image", "Layer", "Type", "Select", "Filter", "View", "Window", "Help"];
+
+/// The menu bar's titles: [`TOP_MENUS`], with the launching integration's menu
+/// ([`host_menu`], `--host-menu`) right after Window.
+pub(crate) fn top_menus(app: &PhotocraftApp) -> Vec<String> {
+    with_host_title(host_menu::title(app))
+}
+
+/// [`top_menus`] for a list of menu rows: a top title outside [`TOP_MENUS`] is the host menu's.
+pub(crate) fn top_menus_of(items: &[items::MenuItem]) -> Vec<String> {
+    let host = items.iter().filter_map(|i| i.path.first()).find(|t| !TOP_MENUS.contains(&t.as_str()));
+    with_host_title(host.map(String::as_str))
+}
+
+fn with_host_title(host: Option<&str>) -> Vec<String> {
+    let mut tops: Vec<String> = TOP_MENUS.iter().map(|t| (*t).to_string()).collect();
+    if let Some(title) = host {
+        let at = tops.iter().position(|t| t == "Help").unwrap_or(tops.len());
+        tops.insert(at, title.to_string());
+    }
+    tops
+}
 
 /// UI-level commands (handled by the shell rather than the engine): id, label, menu, shortcut.
 /// The table is the engine's ([`photocraft_engine::shell_commands::SHELL_COMMANDS`]), so the

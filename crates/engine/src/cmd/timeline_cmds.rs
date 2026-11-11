@@ -32,6 +32,7 @@ fn has_timeline(s: &Session) -> std::result::Result<(), String> {
 fn with_timeline(s: &mut Session, f: impl FnOnce(&mut Option<Timeline>)) -> Result<Value> {
     let st = s.active_mut().ok_or(EngineError::NoDocument)?;
     let generation = photocraft_raster::spill::read_error_generation();
+    let before = Arc::clone(&st.doc);
     let mut doc = (*st.doc).clone();
     crate::video_cmds::store(&mut doc);
     f(&mut doc.timeline);
@@ -42,6 +43,10 @@ fn with_timeline(s: &mut Session, f: impl FnOnce(&mut Option<Timeline>)) -> Resu
     // Storing and syncing video frames bypasses edit_with: apply the same scratch guard.
     photocraft_raster::spill::check_since(generation).and_then(|()| doc.scratch_health()).map_err(EngineError::Other)?;
     st.doc = Arc::new(doc);
+    // Moving the playhead swaps the pixels of every video layer. Report what changed: without
+    // this the canvas reused the previous command's damage (e.g. the empty area of a layer
+    // selection) and redrew nothing while Play stepped the frame counter.
+    st.last_damage = crate::layer_multi_cmds::step_damage(&before, &st.doc);
     st.revision += 1;
     info(s)
 }
