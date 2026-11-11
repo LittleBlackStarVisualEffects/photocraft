@@ -1571,8 +1571,22 @@ fn app_methods(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlReques
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             ok(Value::Null)
         }
+        "app.newVideoLayer" => app_new_video_layer(app, p),
+        // Clicks on the launching integration's menu (`--host-menu`) since the last call.
+        "host.events" => ok(crate::host_menu::drain(app)),
         _ => return None,
     })
+}
+
+/// The `app.newVideoLayer` control method: Layer › Video Layers › New Video Layer from File with
+/// every frame file read through the automation read capability. The engine command reads an
+/// ambient path, so automation refuses it; pipelines load image sequences with this instead.
+fn app_new_video_layer(app: &mut PhotocraftApp, p: &Value) -> Outcome {
+    let Some(read) = app.services.automation_read.as_mut() else {
+        return err("automation read authority is not configured");
+    };
+    let mut read_bytes = |path: &str| read(path).map(|r| r.bytes);
+    wrap(photocraft_engine::new_video_layer_from_reader(&mut app.session, p, &mut read_bytes).map_err(|e| e.to_string()))
 }
 
 /// The `app.open` control method: opens a path through the configured automation read

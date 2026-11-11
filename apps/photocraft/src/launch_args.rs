@@ -54,6 +54,11 @@ pub(crate) struct LaunchArgs {
     /// Start the localhost JSON-lines control server on this port
     #[arg(long, value_name = "PORT", env = "PHOTOCRAFT_CONTROL_PORT", value_parser = control_port, allow_negative_numbers = true)]
     pub(crate) control: Option<u16>,
+    /// A pipeline integration's menu, shown after Window: a JSON file {"title", "items": [{"id",
+    /// "label"} | {"separator": true}]}. A click runs nothing in PhotoCraft; the integration
+    /// collects it over the control channel (host.events)
+    #[arg(long, value_name = "FILE", env = "PHOTOCRAFT_HOST_MENU")]
+    pub(crate) host_menu: Option<PathBuf>,
     #[command(flatten)]
     pub(crate) auth: ControlArgs,
     #[command(flatten)]
@@ -79,6 +84,7 @@ pub(crate) enum PerProcess {
     PresentMode,
     FrameLatency,
     StrokeTrace,
+    HostMenu,
     /// PHOTOCRAFT_GPU_ADAPTER, when startup will act on it (`gpu_startup`). Not a flag.
     GpuAdapterEnv,
 }
@@ -87,8 +93,16 @@ impl PerProcess {
     /// The flags, in the order a log line lists them. A flag's variable asks for the same thing, so
     /// it counts too (#7242); the variables that aren't a flag's fallback are counted by
     /// `single_instance::env_launch_options`.
-    pub(crate) const FLAGS: [PerProcess; 7] =
-        [Self::AutomationReadRoot, Self::AutomationWriteRoot, Self::SafeGpu, Self::InWindowMenus, Self::PresentMode, Self::FrameLatency, Self::StrokeTrace];
+    pub(crate) const FLAGS: [PerProcess; 8] = [
+        Self::AutomationReadRoot,
+        Self::AutomationWriteRoot,
+        Self::SafeGpu,
+        Self::InWindowMenus,
+        Self::PresentMode,
+        Self::FrameLatency,
+        Self::StrokeTrace,
+        Self::HostMenu,
+    ];
 
     /// The flag's clap argument id.
     fn id(self) -> Option<&'static str> {
@@ -100,6 +114,7 @@ impl PerProcess {
             Self::PresentMode => "present_mode",
             Self::FrameLatency => "frame_latency",
             Self::StrokeTrace => "stroke_trace",
+            Self::HostMenu => "host_menu",
             Self::GpuAdapterEnv => return None,
         })
     }
@@ -115,6 +130,7 @@ impl fmt::Display for PerProcess {
             Self::PresentMode => "--present-mode",
             Self::FrameLatency => "--frame-latency",
             Self::StrokeTrace => "--stroke-trace",
+            Self::HostMenu => "--host-menu",
             Self::GpuAdapterEnv => "PHOTOCRAFT_GPU_ADAPTER",
         })
     }
@@ -239,6 +255,7 @@ mod tests {
             "--present-mode",
             "--frame-latency",
             "--stroke-trace",
+            "--host-menu",
         ] {
             let err = usage_error(&[flag]);
             assert!(err.contains(&format!("a value is required for '{flag} <")), "{flag}: {err}");
@@ -280,6 +297,8 @@ mod tests {
             "Mailbox",
             "--frame-latency",
             "1",
+            "--host-menu",
+            "/m.json",
             "photo.psd",
         ])
         .unwrap();
@@ -292,6 +311,7 @@ mod tests {
         assert_eq!(parsed.present_mode, Some(PresentMode::AutoNoVsync));
         assert_eq!(parsed.frame_latency, Some(1));
         assert_eq!(parsed.stroke_trace.as_deref(), Some("stderr"));
+        assert_eq!(parsed.host_menu.as_deref(), Some(std::path::Path::new("/m.json")));
         // In a fixed order: `single_instance` only lists them in a log line.
         assert_eq!(parsed.launch_options, PerProcess::FLAGS);
         assert_eq!(parsed.file_names(), FileNames { openable: vec!["photo.psd".to_string()], unreadable: vec![] });

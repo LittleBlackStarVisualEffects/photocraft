@@ -339,6 +339,36 @@ fn write_start_marker(sentinel: &gpu_startup::SharedSentinel, plan: &gpu_startup
     }
 }
 
+/// Largest `--host-menu` file read: a definition is a few hundred bytes.
+const MAX_HOST_MENU_BYTES: u64 = 256 << 10;
+
+/// The `--host-menu` file (`PHOTOCRAFT_HOST_MENU`) as the menu shown after Window, or what is
+/// wrong with it: a bad file adds no menu and is reported once the window is up.
+fn read_host_menu(path: Option<&std::path::Path>) -> (Option<photocraft_ui_egui::host_menu::HostMenu>, Option<String>) {
+    let Some(path) = path else { return (None, None) };
+    let parsed = std::fs::metadata(path)
+        .map_err(|e| e.to_string())
+        .and_then(|m| if m.len() > MAX_HOST_MENU_BYTES { Err(format!("larger than {} KiB", MAX_HOST_MENU_BYTES >> 10)) } else { Ok(()) })
+        .and_then(|()| std::fs::read(path).map_err(|e| e.to_string()))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string()))
+        .and_then(|v| photocraft_ui_egui::host_menu::HostMenu::from_json(&v));
+    match parsed {
+        Ok(menu) => (Some(menu), None),
+        Err(e) => {
+            let problem = format!("{}: {e}", path.display());
+            log::warn!("host menu not added: {problem}");
+            (None, Some(problem))
+        }
+    }
+}
+
+/// Tell the user why the `--host-menu` file added no menu.
+fn report_host_menu_problem(app: &mut PhotocraftApp, problem: Option<String>) {
+    if let Some(problem) = problem {
+        photocraft_ui_egui::notices::post(app, "The pipeline menu was not added", vec![problem], true, None);
+    }
+}
+
 fn main() -> eframe::Result {
     // Before anything starts a thread: may re-execute this process with glibc tuned to return
     // the memory of closed documents (#8743).
@@ -371,6 +401,7 @@ fn main() -> eframe::Result {
         present_mode,
         frame_latency,
         stroke_trace,
+        host_menu,
         control: control_port,
         auth,
         automation,
@@ -378,6 +409,7 @@ fn main() -> eframe::Result {
     } = launch;
 
     attach_log_file(logger);
+    let (host_menu, host_menu_problem) = read_host_menu(host_menu.as_deref());
 
     // An adapter named in the environment is chosen at startup, which a forwarded launch never reaches.
     let rendering_mode = gpu_startup::read_rendering_prefs(services::prefs_file().as_deref()).1;
@@ -502,6 +534,7 @@ fn main() -> eframe::Result {
             let automation = control.as_ref().map(|(_, _, workspace)| workspace.clone());
             let mut services = services::native(automation);
             services.preset_store = presets;
+            services.host_menu = host_menu;
             #[cfg(target_os = "linux")]
             let display = tablet::DisplayKind::of(cc);
             #[cfg(target_os = "linux")]
@@ -685,6 +718,7 @@ fn main() -> eframe::Result {
             app.services.pen_screen_px = tablet::pen_screen_service();
             // Paths on the command line (Linux/Windows file associations, `photocraft a.psd`).
             app.open_paths(&files);
+            report_host_menu_problem(&mut app, host_menu_problem);
             if !unreadable_paths.is_empty() {
                 use photocraft_ui_egui::i18n;
                 let line = i18n::t("{path}: the path is not valid Unicode; rename the file and open it again.");

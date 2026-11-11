@@ -593,7 +593,10 @@ fn translate(bar: &mut MenuBar, lang: Lang) {
         for n in nodes {
             match n {
                 // A document's name is shown as it is.
-                Node::Item(it) if it.role.is_none() && !it.id.starts_with(crate::menus::DOCUMENT_ITEM) => it.label = tr_id(lang, &it.id, &it.label).to_string(),
+                // So are the launching integration's own labels (`--host-menu`).
+                Node::Item(it) if it.role.is_none() && !it.id.starts_with(crate::menus::DOCUMENT_ITEM) && !crate::host_menu::owns(&it.id) => {
+                    it.label = tr_id(lang, &it.id, &it.label).to_string()
+                }
                 Node::Submenu { label, children, role } => {
                     if role.is_none() {
                         *label = tr(lang, label).to_string();
@@ -605,7 +608,8 @@ fn translate(bar: &mut MenuBar, lang: Lang) {
         }
     }
     for m in &mut bar.menus {
-        if m.role != MenuRole::App {
+        // PhotoCraft's own titles; the host menu's title is shown as given.
+        if m.role != MenuRole::App && crate::menus::TOP_MENUS.contains(&m.title.as_str()) {
             m.title = tr(lang, &m.title).to_string();
         }
         walk(&mut m.children, lang);
@@ -615,7 +619,10 @@ fn translate(bar: &mut MenuBar, lang: Lang) {
 /// PhotoCraft's menus as a Mac menu bar, in the UI language; `language` is the
 /// `interface.language` preference (`auto` or a code), checked in the app menu's Language.
 pub fn photocraft_layout(items: &[MenuItem], lang: Lang, language: &str) -> Layout {
-    let mut bar = from_items(&crate::menus::TOP_MENUS, items);
+    // PhotoCraft's menus, and the launching integration's (`--host-menu`) after Window.
+    let titles = crate::menus::top_menus_of(items);
+    let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+    let mut bar = from_items(&titles, items);
     bar.tag_item("help.about", ItemRole::About);
     bar.tag_item("file.exit", ItemRole::Quit);
     bar.tag_submenu("Edit", "Preferences", ItemRole::Settings);

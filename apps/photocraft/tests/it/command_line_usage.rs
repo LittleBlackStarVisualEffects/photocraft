@@ -9,13 +9,14 @@
 //! so stderr shows how the other arguments were taken.
 
 /// The variables the command line reads: a test that wants one sets it.
-const VARS: [&str; 6] = [
+const VARS: [&str; 7] = [
     "PHOTOCRAFT_CONTROL_PORT",
     "PHOTOCRAFT_CONTROL_TOKEN",
     "PHOTOCRAFT_CONTROL_TOKEN_FILE",
     "PHOTOCRAFT_AUTOMATION_READ_ROOT",
     "PHOTOCRAFT_AUTOMATION_WRITE_ROOT",
     "PHOTOCRAFT_IN_WINDOW_MENUS",
+    "PHOTOCRAFT_HOST_MENU",
 ];
 
 /// A usage error found only after every argument is read.

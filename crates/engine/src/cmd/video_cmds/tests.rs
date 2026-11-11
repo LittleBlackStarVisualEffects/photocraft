@@ -969,3 +969,80 @@ fn render_video_names_frames_after_the_leaf_of_the_document_name() {
         assert!(!stem.contains(['/', '\\']) && !stem.is_empty() && stem.chars().any(|c| c != '.'), "{hostile:?} -> {stem:?}");
     }
 }
+
+/// Play stepped "Frame N / M" but the canvas kept showing the same picture: `timeline.setFrame`
+/// bumped the revision without reporting damage, so the canvas reused the previous command's
+/// (the empty area a Layers panel click reports) and redrew nothing.
+#[test]
+fn frame_step_redraws_after_a_layer_selection() {
+    let dir = tmpdir("step-damage");
+    write_png(&format!("{dir}/f01.png"), 16, 12, "#ff0000");
+    write_png(&format!("{dir}/f02.png"), 16, 12, "#00ff00");
+    let mut s = session();
+    let r = s.execute("layer.videoLayers.newVideoLayerFromFile", json!({"path": dir})).unwrap();
+    let id = r["layer"].as_u64().unwrap();
+    s.execute("layer.select", json!({"layer": id})).unwrap();
+    s.execute("timeline.setFrame", json!({"frame": 1})).unwrap();
+    let damage = s.active().unwrap().last_damage;
+    assert!(damage.is_none_or(|r| !r.is_empty()), "the frame step redraws nothing: {damage:?}");
+}
+
+fn png_bytes(w: u32, h: u32, color: &str) -> Vec<u8> {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": w, "height": h, "background": color})).unwrap();
+    photocraft_io::export(&s.active().unwrap().doc, "png", &photocraft_io::ExportOptions::default()).unwrap().bytes
+}
+
+/// `app.newVideoLayer`: frames come from the reader (the automation read roots), in the order
+/// given, and make the same layer and timeline as New Video Layer from File.
+#[test]
+fn video_layer_from_reader_reads_every_frame_in_order() {
+    let files = [("shot/f.1001.png", "#ff0000"), ("shot/f.1002.png", "#00ff00"), ("shot/f.1003.png", "#0000ff")];
+    let mut read_order = Vec::new();
+    let mut read = |path: &str| -> std::result::Result<Vec<u8>, String> {
+        read_order.push(path.to_string());
+        files.iter().find(|(p, _)| *p == path).map(|(_, c)| png_bytes(16, 12, c)).ok_or_else(|| "not granted".to_string())
+    };
+    let mut s = session();
+    let paths: Vec<&str> = files.iter().map(|(p, _)| *p).collect();
+    let r = new_video_layer_from_reader(&mut s, &json!({"paths": paths, "fps": 24.0, "name": "plateMain"}), &mut read).unwrap();
+    assert_eq!(r["frames"], 3);
+    assert_eq!(read_order, paths);
+    let id = LayerId(r["layer"].as_u64().unwrap());
+    let doc = &s.active().unwrap().doc;
+    let layer = doc.layer(id).unwrap();
+    assert_eq!(layer.name, "plateMain");
+    let video = layer.video.as_ref().unwrap();
+    assert_eq!(video.frames.len(), 3);
+    assert!(matches!(&video.source, photocraft_doc::VideoSource::File { path } if path == "shot"));
+    let timeline = doc.timeline.as_ref().unwrap();
+    assert_eq!((timeline.duration, timeline.fps), (3, 24.0));
+}
+
+/// Hostile params and an unreadable frame are errors that change nothing, never a panic.
+#[test]
+fn video_layer_from_reader_rejects_bad_requests() {
+    let mut read = |path: &str| -> std::result::Result<Vec<u8>, String> {
+        if path == "ok.png" { Ok(png_bytes(4, 4, "#ffffff")) } else { Err("outside the read roots".into()) }
+    };
+    let mut s = session();
+    let layers = s.active().unwrap().doc.layers.len();
+    for p in [
+        json!({}),
+        json!({"paths": []}),
+        json!({"paths": "ok.png"}),
+        json!({"paths": [1, 2]}),
+        json!({"paths": [""]}),
+        json!({"paths": ["ok.png"], "fps": 0}),
+        json!({"paths": ["ok.png"], "fps": "fast"}),
+        json!({"paths": ["ok.png"], "name": 7}),
+        json!({"paths": ["ok.png"], "name": "  "}),
+        json!({"paths": ["ok.png", "elsewhere.png"]}),
+    ] {
+        assert!(new_video_layer_from_reader(&mut s, &p, &mut read).is_err(), "{p} must be refused");
+        assert_eq!(s.active().unwrap().doc.layers.len(), layers, "{p}: nothing is added");
+        assert!(s.active().unwrap().doc.timeline.is_none(), "{p}: no timeline is made");
+    }
+    let mut none = Session::new();
+    assert!(new_video_layer_from_reader(&mut none, &json!({"paths": ["ok.png"]}), &mut read).is_err(), "no document");
+}

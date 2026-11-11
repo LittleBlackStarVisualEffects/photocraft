@@ -2,7 +2,7 @@ use super::invoke::invoke;
 use super::items::{ItemCache, MenuItem, menu_items};
 use super::render::{alt_click, render_level, render_level_rows};
 use super::search::help_search;
-use super::{PhotocraftApp, TOP_MENUS, Value, json};
+use super::{PhotocraftApp, Value, json};
 
 /// Draws the menu bar; returns the inner edge of the menu titles, facing the rest of the title bar
 /// (the right edge of the last title, or its left edge in a right-to-left UI, where File is at the
@@ -12,6 +12,10 @@ pub fn menu_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> f32 {
     // document (layer lookups), which cost milliseconds per frame on large layouts (#125). While
     // one stays open, the items are reused until what they depend on changes.
     let kept = std::cell::Cell::new(app.menu_cache.take());
+    // The titles, with the launching integration's menu (`--host-menu`) after Window.
+    let top_titles = super::top_menus(app);
+    let host_title = crate::host_menu::title(app).map(str::to_string);
+    let titles: Vec<&str> = top_titles.iter().map(String::as_str).collect();
     let built: std::cell::OnceCell<ItemCache> = std::cell::OnceCell::new();
     let app_ref: &PhotocraftApp = app;
     let rtl = crate::direction::is_rtl();
@@ -24,10 +28,12 @@ pub fn menu_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> f32 {
     let mut keys = crate::menu_keys::Keys::load(ui.ctx());
     keys.take_first_row(&mut nav);
     nav.underline = keys.show_underlines(ui.ctx());
-    let translated: Vec<String> = TOP_MENUS.iter().map(|top| crate::i18n::tr(lang, top).to_string()).collect();
-    let preferred: Vec<Option<char>> = TOP_MENUS.iter().map(|top| crate::menu_keys::TOP_PREFERRED.iter().find(|(t, _)| t == top).map(|(_, c)| *c)).collect();
+    // The integration's own title is shown as given.
+    let translated: Vec<String> =
+        titles.iter().map(|top| if host_title.as_deref() == Some(*top) { (*top).to_string() } else { crate::i18n::tr(lang, top).to_string() }).collect();
+    let preferred: Vec<Option<char>> = titles.iter().map(|top| crate::menu_keys::TOP_PREFERRED.iter().find(|(t, _)| t == top).map(|(_, c)| *c)).collect();
     // A title with no Latin letter shows its English key: "文件(F)" (#5863).
-    let (top_labels, top_mnemonics) = crate::menu_keys::localized(&translated, &TOP_MENUS, &preferred);
+    let (top_labels, top_mnemonics) = crate::menu_keys::localized(&translated, &titles, &preferred);
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         let v = &mut ui.style_mut().visuals;
@@ -41,12 +47,12 @@ pub fn menu_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> f32 {
             let ui = mirrored.as_mut().unwrap_or(ui);
             ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
             nav.bar_bottom = Some(ui.max_rect().bottom());
-            let mut buttons = Vec::with_capacity(TOP_MENUS.len());
-            for (k, top) in TOP_MENUS.iter().enumerate() {
+            let mut buttons = Vec::with_capacity(titles.len());
+            for (k, top) in titles.iter().enumerate() {
                 // egui's menu_button toggles on release; these titles open on the press (one
                 // gesture can press, drag to an item and release), so each drives its popup.
                 // The title the keyboard is on (Alt / F10) is lit like a hovered one.
-                let focused = keys.focus == Some(if rtl { TOP_MENUS.len() - 1 - k } else { k });
+                let focused = keys.focus == Some(if rtl { titles.len() - 1 - k } else { k });
                 let label = if nav.underline {
                     crate::menu_keys::mnemonic_text(ui, "", &top_labels[k], top_mnemonics[k], Some(t.text_dim))
                 } else {
