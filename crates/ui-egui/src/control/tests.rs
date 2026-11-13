@@ -8,6 +8,17 @@ fn call(app: &mut PhotocraftApp, ctx: &egui::Context, method: &str, params: Valu
     }
 }
 
+/// A long plate takes minutes to decode: `app.newVideoLayer` gets the long reply deadline, so the
+/// caller gets the reply instead of a timeout while the load completes; other methods keep 60 s.
+#[test]
+fn footage_imports_get_the_long_reply_deadline() {
+    assert_eq!(super::reply_deadline("app.newVideoLayer"), super::FOOTAGE_REPLY_DEADLINE);
+    assert!(super::FOOTAGE_REPLY_DEADLINE > super::REPLY_DEADLINE);
+    for method in ["app.save", "app.open", "engine.execute", "ui.inspect"] {
+        assert_eq!(super::reply_deadline(method), super::REPLY_DEADLINE, "{method}");
+    }
+}
+
 /// #3674: a guessed name gets a pointer to the right one, in both directions; and every
 /// method listed for those hints is served.
 #[test]
@@ -1385,6 +1396,45 @@ fn synthetic_shortcuts_use_the_automation_command_policy() {
     app.automation_input = true;
     let error = crate::menus::invoke(&mut app, &ctx, "file.open", json!({})).unwrap_err();
     assert_eq!(error, "filesystem command denied");
+}
+
+/// `app.save` refuses to flatten a timeline into a PSD/PSB unless `allowFlatten` says so: reopened,
+/// the file would hold stills and play one frame.
+#[test]
+fn automation_save_refuses_psd_for_an_animated_document_unless_flattening_is_allowed() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let written: Rc<RefCell<Vec<String>>> = Rc::default();
+    let w = written.clone();
+    let services = crate::Services {
+        export: Some(Box::new(|_d: &photocraft_doc::Document, _p: &str, _s: &crate::ExportSettings| Ok((b"out".to_vec(), Vec::new())))),
+        automation_write: Some(Box::new(move |path: &str, _b: &[u8]| {
+            w.borrow_mut().push(path.to_string());
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
+    let ctx = egui::Context::default();
+    app.run("file.new", json!({"width": 8, "height": 8})).unwrap();
+    // A still document saves as PSD as before.
+    let r = call(&mut app, &ctx, "app.save", json!({"path": "still.psd"}));
+    assert_eq!(r["ok"], true, "{r}");
+
+    app.run("timeline.create", json!({"duration": 4, "fps": 24.0})).unwrap();
+    for path in ["shot.psd", "shot.PSB"] {
+        let r = call(&mut app, &ctx, "app.save", json!({"path": path}));
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["error"].as_str().unwrap().contains(".pcraft"), "{r}");
+    }
+    let r = call(&mut app, &ctx, "app.save", json!({"path": "shot.psd", "allowFlatten": "yes"}));
+    assert!(r["error"].as_str().unwrap().contains("allowFlatten"), "{r}");
+    assert_eq!(*written.borrow(), ["still.psd"], "a refused save writes nothing");
+
+    // Native files keep the frames; flattening on purpose is allowed.
+    assert_eq!(call(&mut app, &ctx, "app.save", json!({"path": "shot.pcraft"}))["ok"], true);
+    assert_eq!(call(&mut app, &ctx, "app.save", json!({"path": "frame.psd", "allowFlatten": true}))["ok"], true);
+    assert_eq!(*written.borrow(), ["still.psd", "shot.pcraft", "frame.psd"]);
 }
 
 /// `app.save` takes the Targa bits per pixel (`tgaBits`) and never stops at Targa Options.

@@ -243,6 +243,27 @@ impl Headless {
         })
     }
 
+    /// Load footage (an image sequence, one file per frame in the order given) as a video layer
+    /// with every frame read beneath the read root: the capability-scoped
+    /// `layer.videoLayers.newVideoLayerFromFile`, which takes an ambient path and is refused in
+    /// automation. The desktop control channel's `app.newVideoLayer`, with the same params
+    /// (`paths`, `fps`, `name`, `center`, `fit`).
+    pub fn new_video_layer(&mut self, index: Option<usize>, params: &Value) -> Result<Value, AutomationError> {
+        self.on_doc(index, |this| {
+            this.sync_jobs();
+            let filesystem = &this.filesystem;
+            let mut read = |path: &str| -> Result<Vec<u8>, String> {
+                match filesystem {
+                    Filesystem::Workspace(workspace) => workspace.read(path).map_err(|e| e.to_string()),
+                    // Where ambient paths are allowed the frames are read as any command reads them.
+                    Filesystem::TrustedLocal => std::fs::read(path).map_err(|e| e.to_string()),
+                    Filesystem::Denied => Err("automation filesystem access is not granted: read authority is absent".into()),
+                }
+            };
+            Ok(photocraft_engine::new_video_layer_from_reader(&mut this.session, params, &mut read)?)
+        })
+    }
+
     /// Replace a smart object's contents with a file from the read root: the capability-scoped
     /// `layer.smartObjects.replaceContents`, which takes an ambient `path` and is refused in
     /// automation (#8061). `params` is the command's own (`layer`).

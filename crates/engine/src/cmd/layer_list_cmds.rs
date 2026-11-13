@@ -21,6 +21,14 @@ fn has_doc(s: &Session) -> std::result::Result<(), String> {
 /// One layer's row: what an agent needs to pick a layer to work on.
 fn row(l: &Layer, selected: &[LayerId], active: Option<LayerId>) -> Value {
     let bounds = crate::layer_multi_cmds::layer_bounds(l).map(|r| [r.x0, r.y0, r.width() as i32, r.height() as i32]);
+    // A video layer's content is pixels (its `kind` stays "Pixel"); `video` says it plays.
+    let video = l.video.as_ref().map(|v| {
+        let source = match &v.source {
+            photocraft_doc::VideoSource::File { path } => Some(path.as_str()),
+            photocraft_doc::VideoSource::Blank => None,
+        };
+        json!({"frames": v.len(), "fps": v.fps, "source": source})
+    });
     json!({
         "id": l.id.0,
         "name": l.name,
@@ -29,6 +37,7 @@ fn row(l: &Layer, selected: &[LayerId], active: Option<LayerId>) -> Value {
         "bounds": bounds,
         "selected": selected.contains(&l.id),
         "active": active == Some(l.id),
+        "video": video,
     })
 }
 
@@ -96,7 +105,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: "List Layers",
         menu: &[],
         shortcut: None,
-        params: r##"{"document":index?,"flat":bool=false} → {"layers":[{"id","name","kind","visible","bounds":[x,y,w,h]|null,"selected","active","children"?}],"activeLayer":id?} (top-down; groups list their "children", or with "flat" every layer is one row with its "depth" and "parent" group id)"##,
+        params: r##"{"document":index?,"flat":bool=false} → {"layers":[{"id","name","kind","visible","bounds":[x,y,w,h]|null,"selected","active","video":{"frames","fps","source"}|null,"children"?}],"activeLayer":id?} (top-down; groups list their "children", or with "flat" every layer is one row with its "depth" and "parent" group id; a video layer's "kind" is "Pixel" and its "video" is set)"##,
         enabled: has_doc,
         run,
         journal: false,
@@ -111,6 +120,20 @@ mod tests {
         let mut s = Session::new();
         s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
         s
+    }
+
+    #[test]
+    fn video_layers_say_they_play() {
+        let mut s = session_with_doc();
+        s.execute("timeline.create", json!({"duration": 5, "fps": 24.0})).unwrap();
+        let video = s.execute("layer.videoLayers.newBlankVideoLayer", json!({})).unwrap()["layer"].as_u64().unwrap();
+        let r = s.execute(ID, json!({"flat": true})).unwrap();
+        let rows = r["layers"].as_array().unwrap();
+        let row = rows.iter().find(|l| l["id"] == video).unwrap();
+        // Still pixels to every command that edits them.
+        assert_eq!(row["kind"], "Pixel", "{r}");
+        assert_eq!((row["video"]["frames"].as_u64(), row["video"]["fps"].as_f64(), &row["video"]["source"]), (Some(5), Some(24.0), &Value::Null), "{r}");
+        assert!(rows.iter().filter(|l| l["id"] != video).all(|l| l["video"].is_null()), "{r}");
     }
 
     #[test]

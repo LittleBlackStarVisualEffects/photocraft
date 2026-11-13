@@ -32,7 +32,7 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
     // Last frame's task bar rect, unless the bar can't show now (hidden by `ui.set` before the
     // next draw).
     let task_bar_rect = app.ui.task_bar_shown.filter(|_| crate::crop_task_bar::eligible(app));
-    json!({
+    let mut inspected = json!({
         "window": {"width": screen.width(), "height": screen.height(), "pixelsPerPoint": ctx.pixels_per_point()},
         "scratch": photocraft_raster::spill::stats(),
         "memory": photocraft_raster::memory::stats(),
@@ -136,7 +136,13 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
         "jobs": crate::jobs_ui::inspect(app),
         "histogram": crate::histogram_panel::inspect(app),
         "cameraRaw": app.camera_raw.as_ref().map(|d| d.describe(&app.ui.camera_raw_scope, &app.ui.camera_raw_preview)),
-    })
+    });
+    // Set after the literal, which is already close to the `json!` recursion limit.
+    // The startup prompt offering a newer release: a separate window from `updatesOpen`'s.
+    inspected["updatePromptOpen"] = json!(crate::updates_ui::prompt_shown(app));
+    // Window › Timeline: `open`, `playing` and `renderFormat` (the playhead is in `timeline.info`).
+    inspected["timeline"] = json!(app.ui.timeline);
+    inspected
 }
 
 pub fn save_screenshot(app: &mut PhotocraftApp, image: &egui::ColorImage, path: Option<&str>) -> Value {

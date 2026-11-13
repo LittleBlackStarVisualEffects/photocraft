@@ -592,6 +592,10 @@ fn invoke_export_command(app: &mut PhotocraftApp, id: &str, params: &Value) -> R
             {
                 let document = app.session.active().ok_or("no document")?.doc.id;
                 let mut render_params = params.as_object().cloned().unwrap_or_default();
+                // The Timeline panel's format (PNG, JPG or OpenEXR) unless the caller names one.
+                if !render_params.contains_key("format") {
+                    render_params.insert("format".into(), json!(app.ui.timeline.render_format.ext()));
+                }
                 Some(app.ask_folder(move |app, dir| {
                     render_params.insert("dir".into(), json!(dir));
                     app.with_document(document, |app| app.run("file.export.renderVideo", Value::Object(render_params)))

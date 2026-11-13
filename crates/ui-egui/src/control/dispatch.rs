@@ -708,6 +708,11 @@ impl PanelSet {
         }
         if let Some(open) = self.updates_open {
             app.ui.updates_open = open;
+            // Closing also closes the startup prompt offering a newer release (it is a separate
+            // window, and the public build would replace a pipeline's own).
+            if !open {
+                crate::updates_ui::hide_prompt(app);
+            }
         }
         if let Some(m) = self.vector_mask_target {
             app.end_filter_mask_view();
@@ -1558,11 +1563,14 @@ fn app_methods(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlReques
         "app.save" => match crate::FormatChoices::from_params(p, "app.save") {
             Ok(choices) => {
                 let path = str_param(p, "path").map(str::to_string);
-                run_waiting(app, wait_param(p), move |app| {
-                    // Saving bypasses `menus::invoke`: a Type box drag in progress applies its box first.
-                    crate::type_box_preview::end_drag(app);
-                    app.save_automation_with(path, choices)
-                })
+                match flatten_refusal(app, path.as_deref(), p) {
+                    Some(e) => err(e),
+                    None => run_waiting(app, wait_param(p), move |app| {
+                        // Saving bypasses `menus::invoke`: a Type box drag in progress applies its box first.
+                        crate::type_box_preview::end_drag(app);
+                        app.save_automation_with(path, choices)
+                    }),
+                }
             }
             Err(e) => err(e),
         },
@@ -1572,9 +1580,35 @@ fn app_methods(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlReques
             ok(Value::Null)
         }
         "app.newVideoLayer" => app_new_video_layer(app, p),
+        // The footage memory limit `app.newVideoLayer` applies, and where it comes from.
+        "app.footageBudget" => ok(photocraft_engine::footage_budget_info(&app.session)),
         // Clicks on the launching integration's menu (`--host-menu`) since the last call.
         "host.events" => ok(crate::host_menu::drain(app)),
+        // Window › Timeline's Play and Stop. Its buttons are egui drawing, which the channel can
+        // only click by screen position (`ui.click`).
+        "timeline.play" => wrap(crate::timeline_ui::play(app)),
+        "timeline.stop" => wrap(crate::timeline_ui::stop(app, p)),
+        "timeline.state" => ok(crate::timeline_ui::state(app)),
         _ => return None,
+    })
+}
+
+/// Why `app.save` refuses: PSD and PSB keep no timeline, so a document with one or with video
+/// layers would be saved as the frame at the playhead and reopen as stills, which a pipeline must
+/// not do silently. `allowFlatten: true` saves anyway (the reply's `warnings` still say so).
+fn flatten_refusal(app: &PhotocraftApp, path: Option<&str>, p: &Value) -> Option<String> {
+    let allow = match p.get("allowFlatten") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Some("`allowFlatten` must be true or false".into()),
+    };
+    let state = app.session.active()?;
+    let target = path.map(str::to_string).or_else(|| state.path.clone())?;
+    let ext = std::path::Path::new(&target).extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    (!allow && matches!(ext.as_str(), "psd" | "psb") && state.doc.has_animation()).then(|| {
+        format!(
+            "{target}: the document has a timeline or video layers, and PSD/PSB would keep only the current frame of each. Save as .pcraft to keep every frame, or pass \"allowFlatten\": true to save the current frame"
+        )
     })
 }
 

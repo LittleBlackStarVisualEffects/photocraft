@@ -28,12 +28,21 @@
 //! - `ui.screenshot {path?, focus?}`: capture the main window (PNG). Raises the window first (default)
 //!   because occluded macOS windows stop rendering
 //! - `ui.focus`: bring the main window to the front
-//! - `app.open {path}` / `app.save {path}`: relative file I/O under the automation roots; reply with `warnings`
+//! - `app.open {path}` / `app.save {path, allowFlatten?}`: relative file I/O under the automation
+//!   roots; reply with `warnings`. A PSD/PSB save of a document with a timeline or video layers is
+//!   refused unless `allowFlatten: true` (it would keep only the current frame)
 //! - `app.quit`
-//! - `app.newVideoLayer {paths, fps?, name?}`: New Video Layer from File with every frame file read
-//!   under the automation read roots, in the order given; reply `{layer, frames}`
+//! - `app.newVideoLayer {paths, fps?, name?, center?, fit?, memoryLimitMB?}`: New Video Layer from
+//!   File with every frame file read under the automation read roots, in the order given, centred
+//!   on the canvas unless `center: false` (`fit: true` scales it to fit first); `memoryLimitMB`
+//!   replaces the footage limit for this import; reply `{layer, frames}`
+//! - `app.footageBudget`: the footage limit imports get (`limitMB`, `source`, `automaticMB`,
+//!   `maxMB`, `env`, `spill`, `availableRamMB`)
 //! - `host.events`: the clicks on the launching integration's menu (`--host-menu`) since the
 //!   last call, oldest first, as `{events: [{id, label}]}`; the queue is emptied
+//! - `timeline.play` / `timeline.stop {rewind?}` / `timeline.state`: Window › Timeline's Play and
+//!   Stop (Play opens the panel; playback keeps time by skipping frames it can't show in time);
+//!   each replies `{playing, open, renderFormat, timeline}`
 //! - `jobs.list` / `jobs.cancel {job?}`: background jobs (#210) with progress; cancel one (or all).
 //!   `engine.execute`, `ui.menu.invoke` and `ui.dialog.confirm` wait for a command that runs as a
 //!   job unless `wait: false` (then the reply is `{job, pending: true}`)
@@ -62,6 +71,17 @@ pub type ControlResponse = Value;
 
 /// The control server's per-request reply deadline.
 pub const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Reply deadline of `app.newVideoLayer`: decoding a long plate (54 frames of 4448 × 3096 is
+/// over 3 GiB) takes minutes, and a reply after [`REPLY_DEADLINE`] would tell the caller the
+/// load failed while it still completes.
+pub const FOOTAGE_REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The reply deadline of a control `method`: [`FOOTAGE_REPLY_DEADLINE`] for footage imports,
+/// [`REPLY_DEADLINE`] otherwise.
+pub fn reply_deadline(method: &str) -> std::time::Duration {
+    if method == "app.newVideoLayer" { FOOTAGE_REPLY_DEADLINE } else { REPLY_DEADLINE }
+}
 
 /// The error the transport thread returns when a dispatched command gave no reply within
 /// [`REPLY_DEADLINE`]. It warns that the command may still apply: re-sending blindly could apply
@@ -188,6 +208,7 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest
 mod tests;
 
 pub(super) const METHODS: &[&str] = &[
+    "app.footageBudget",
     "app.newVideoLayer",
     "app.open",
     "app.quit",
@@ -197,6 +218,9 @@ pub(super) const METHODS: &[&str] = &[
     "host.events",
     "jobs.cancel",
     "jobs.list",
+    "timeline.play",
+    "timeline.state",
+    "timeline.stop",
     "ui.click",
     "ui.context.choose",
     "ui.dialog.apply",

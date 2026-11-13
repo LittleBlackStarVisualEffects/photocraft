@@ -15,13 +15,14 @@ use crate::{EngineError, Result, Session};
 /// quantised frame and palette while rendering, so the document canvas limit is not enough.
 const MAX_GIF_FRAME_PIXELS: u64 = 64 << 20;
 /// Largest total an animated GIF render keeps staged before encoding: one index byte per pixel plus
-/// a 768-byte palette for every frame, the same 2 GiB bound as imported footage ([`MAX_FOOTAGE_BYTES`]).
+/// a 768-byte palette for every frame, 2 GiB (imported footage had the same bound until its limit
+/// became a preference, [`footage_limit`]; this one stays fixed).
 /// The per-frame cap alone lets `frames × pixels` reach terabytes (a 4000 × 4000 canvas over a
 /// 1,000,000-frame timeline). 1920 × 1080 holds about 2,145 frames and 4096 × 2160 about 242.
 /// This bounds the staged frames only (indices and palettes). It does not bound the encoder's output
 /// buffer (LZW data, roughly 1.3-1.5 times the raw size, growing by doubling) or the per-frame
 /// transients (RGBA f32, 16 bytes per pixel), so it is not a bound on peak memory.
-const MAX_GIF_STAGED_BYTES: u64 = MAX_FOOTAGE_BYTES;
+const MAX_GIF_STAGED_BYTES: u64 = 2 << 30;
 /// The GIF format stores each side as 16 bits.
 const MAX_GIF_SIDE: u64 = 65_535;
 
@@ -302,17 +303,213 @@ type ImportFrames = fn(
     &mut dyn FnMut(photocraft_doc::Document, u32) -> std::result::Result<(), photocraft_io::IoError>,
 ) -> std::result::Result<usize, photocraft_io::IoError>;
 
-/// Frame storage one footage import may keep (whole tiles, all frames together).
-const MAX_FOOTAGE_BYTES: u64 = 2 << 30;
+/// Most a footage import may be allowed to keep, in MiB (100 GiB): the frames of one import, whole
+/// tiles, all frames together. Frames beyond the tile budget go to the scratch disk like any tile
+/// (`photocraft_raster::spill`), so the limit can pass the machine's RAM.
+pub const MAX_FOOTAGE_LIMIT_MB: u64 = 102_400;
+/// Environment variable overriding the footage limit (MiB) for one launch, so a pipeline (the
+/// AYON integration) can set it without touching the user's preferences.
+pub const FOOTAGE_BUDGET_ENV: &str = "PHOTOCRAFT_FOOTAGE_BUDGET_MB";
+/// Smallest automatic footage limit, in MiB: the fixed limit of earlier builds.
+const MIN_AUTOMATIC_FOOTAGE_MB: u64 = 2048;
 
-/// The footage frame limit this import applies: the production cap, or a test scope's lowered
-/// cap so a regression can reach the refusal without keeping gibibytes of frames.
-fn footage_byte_limit() -> u64 {
+/// Where the footage limit of an import came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FootageLimitSource {
+    /// The command's `memoryLimitMB`.
+    Param,
+    /// [`FOOTAGE_BUDGET_ENV`].
+    Env,
+    /// Preferences › Performance › Footage Memory Limit.
+    Pref,
+    /// Neither set: the share of RAM Memory Usage allows ([`automatic_footage_limit_mb`]).
+    Automatic,
+}
+
+impl FootageLimitSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Param => "param",
+            Self::Env => "env",
+            Self::Pref => "pref",
+            Self::Automatic => "automatic",
+        }
+    }
+}
+
+/// The automatic footage limit, in MiB: physical RAM (`PHOTOCRAFT_RAM_MB` overrides it) times
+/// Memory Usage's percent (70 % when it is the legacy MB setting), at least the 2048 MiB earlier
+/// builds allowed and at most [`MAX_FOOTAGE_LIMIT_MB`]. 2048 MiB where RAM is unknown (the web).
+pub fn automatic_footage_limit_mb(physical_bytes: Option<u64>, memory_usage_percent: Option<u8>) -> u64 {
+    let percent = u64::from(memory_usage_percent.unwrap_or(70).clamp(1, 95));
+    physical_bytes.map_or(MIN_AUTOMATIC_FOOTAGE_MB, |bytes| ((bytes >> 20) / 100).saturating_mul(percent).clamp(MIN_AUTOMATIC_FOOTAGE_MB, MAX_FOOTAGE_LIMIT_MB))
+}
+
+/// A footage limit in MiB from text (the environment variable): a whole number from 1, capped at
+/// [`MAX_FOOTAGE_LIMIT_MB`]; anything else is ignored.
+fn parse_limit_mb(text: &str) -> Option<u64> {
+    text.trim().parse::<u64>().ok().filter(|mb| *mb > 0).map(|mb| mb.min(MAX_FOOTAGE_LIMIT_MB))
+}
+
+/// The footage limit in MiB and where it came from: the command's `memoryLimitMB`, else
+/// [`FOOTAGE_BUDGET_ENV`], else the preference (0 is automatic), else
+/// [`automatic_footage_limit_mb`]. Pure, for tests.
+pub fn resolve_footage_limit_mb(param_mb: Option<u64>, env: Option<&str>, pref_mb: u32, automatic_mb: u64) -> (u64, FootageLimitSource) {
+    if let Some(mb) = param_mb.filter(|mb| *mb > 0) {
+        return (mb.min(MAX_FOOTAGE_LIMIT_MB), FootageLimitSource::Param);
+    }
+    if let Some(mb) = env.and_then(parse_limit_mb) {
+        return (mb, FootageLimitSource::Env);
+    }
+    if pref_mb > 0 {
+        return (u64::from(pref_mb).min(MAX_FOOTAGE_LIMIT_MB), FootageLimitSource::Pref);
+    }
+    (automatic_mb, FootageLimitSource::Automatic)
+}
+
+/// The footage limit this session applies, in MiB, and its source. `PHOTOCRAFT_TILE_BUDGET_MB`
+/// does not change it: that sets how much of the footage stays in RAM before tiles spill.
+pub fn footage_limit(s: &Session, param_mb: Option<u64>) -> (u64, FootageLimitSource) {
+    let performance = &s.prefs().performance;
+    let automatic = automatic_footage_limit_mb(crate::memory::physical_memory(), performance.memory_usage_percent);
+    let env = std::env::var(FOOTAGE_BUDGET_ENV).ok();
+    resolve_footage_limit_mb(param_mb, env.as_deref(), performance.footage_memory_limit_mb, automatic)
+}
+
+/// The footage frame limit this import applies, in bytes: the session's ([`footage_limit`]), or a
+/// test scope's lowered cap so a regression can reach the refusal without keeping gibibytes of
+/// frames.
+fn footage_byte_limit(s: &Session, param_mb: Option<u64>) -> u64 {
     #[cfg(test)]
     if let Some(limit) = limits::max_footage_bytes() {
         return limit;
     }
-    MAX_FOOTAGE_BYTES
+    footage_limit(s, param_mb).0.saturating_mul(1 << 20)
+}
+
+/// What `app.footageBudget` reports: the limit footage imports get now (`limitMB`, MiB) and where
+/// it comes from (`source`: param, env, pref or automatic), the automatic value (`automaticMB`),
+/// the most it may be (`maxMB`), the environment variable that sets it (`env`), whether frames
+/// past the tile budget go to the scratch disk (`spill`), and the RAM free now (`availableRamMB`,
+/// null when unknown).
+pub fn footage_budget_info(s: &Session) -> Value {
+    let (limit, source) = footage_limit(s, None);
+    let automatic = automatic_footage_limit_mb(crate::memory::physical_memory(), s.prefs().performance.memory_usage_percent);
+    let available = photocraft_raster::memory::system::current().available_ram.map(|b| b >> 20);
+    json!({
+        "limitMB": limit,
+        "source": source.name(),
+        "automaticMB": automatic,
+        "maxMB": MAX_FOOTAGE_LIMIT_MB,
+        "env": FOOTAGE_BUDGET_ENV,
+        "spill": photocraft_raster::spill::enabled(),
+        "availableRamMB": available,
+    })
+}
+
+/// Refuse footage that needs more than the RAM free now plus the scratch disk's room, before it
+/// is decoded: past the tile budget frames go to the scratch disk, and with that full (or spilling
+/// off) the process would run out of memory. The scratch room is measured only when RAM alone is
+/// short (it can take up to 2 s).
+fn check_footage_room(frames: usize, need: u64) -> std::result::Result<(), String> {
+    let Some(ram) = photocraft_raster::memory::system::current().available_ram else { return Ok(()) };
+    if need <= ram {
+        return Ok(());
+    }
+    if !photocraft_raster::spill::enabled() {
+        return Err(format!(
+            "{frames} frames need {} MiB, only {} MiB of RAM is free and the scratch disk is off (Preferences › Scratch Disks)",
+            need >> 20,
+            ram >> 20
+        ));
+    }
+    match photocraft_raster::spill::scratch_capacity() {
+        Some(disk) if need > ram.saturating_add(disk) => Err(format!(
+            "{frames} frames need {} MiB, only {} MiB of RAM and {} MiB of scratch disk are free",
+            need >> 20,
+            ram >> 20,
+            disk >> 20
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The refusal for footage over the limit, with what to change.
+fn over_limit(frames: usize, need: u64, limit: u64) -> String {
+    format!(
+        "{frames} frames need {} MiB, the limit is {} MiB (load fewer frames, or raise Preferences › Performance › Footage Memory Limit, {FOOTAGE_BUDGET_ENV} or `memoryLimitMB`, up to {MAX_FOOTAGE_LIMIT_MB} MiB)",
+        need.div_ceil(1 << 20),
+        limit >> 20
+    )
+}
+
+/// What decoded footage becomes in the active document: its pixel format, and its colour profile.
+/// Frames are converted into the document's profile (an EXR's linear light becomes an sRGB
+/// document's encoding), as a layer copied from another document is, so exporting the document
+/// to EXR gives the source values back and JPG/PNG are display-encoded.
+pub(crate) struct FootageTarget {
+    fmt: photocraft_color::PixelFormat,
+    mode: photocraft_color::ColorMode,
+    icc: Option<std::sync::Arc<Vec<u8>>>,
+    profile: std::sync::Arc<photocraft_cms::Profile>,
+    intent: photocraft_cms::Intent,
+    bpc: bool,
+    exr_aces_cg: bool,
+    /// Bytes of frames the import may keep.
+    max_bytes: u64,
+}
+
+impl FootageTarget {
+    /// The active document's target, with the limit `param_mb` (else the session's).
+    fn of(s: &Session, param_mb: Option<u64>) -> Result<Self> {
+        let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
+        Ok(Self {
+            fmt: doc.pixel_format(),
+            mode: doc.mode,
+            icc: doc.icc_profile.clone(),
+            profile: crate::color_cmds::document_profile(doc),
+            intent: s.color.settings.intent(),
+            bpc: s.color.settings.bpc,
+            exr_aces_cg: s.prefs().file_handling.exr_aces_cg,
+            max_bytes: footage_byte_limit(s, param_mb),
+        })
+    }
+
+    /// A target that keeps the decoded values (no conversion), for tests of the frame stacking.
+    #[cfg(test)]
+    fn raw(fmt: photocraft_color::PixelFormat) -> Self {
+        Self {
+            fmt,
+            mode: fmt.mode,
+            icc: None,
+            profile: crate::color_cmds::working_profile(fmt.mode),
+            intent: photocraft_cms::Intent::RelativeColorimetric,
+            bpc: false,
+            exr_aces_cg: false,
+            max_bytes: u64::MAX,
+        }
+    }
+
+    /// Converts a decoded footage document into this target's colour space. `name` is the file
+    /// (an EXR is tagged with the File Handling ACEScg option, as File › Open does). Only footage
+    /// that states its profile is converted (EXR always does: io tags it linear); untagged frames
+    /// keep their values, as before, so a gray matte or mask sequence stays exact.
+    fn adopt(&self, name: &str, doc: &mut Document) -> Result<()> {
+        crate::file_cmds::tag_exr_colorspace_with(self.exr_aces_cg, name, doc);
+        if doc.icc_profile.is_none() || (doc.mode, &doc.icc_profile) == (self.mode, &self.icc) {
+            return Ok(());
+        }
+        if doc.mode == self.mode && crate::color_cmds::document_profile(doc).same_colors(&self.profile) {
+            return Ok(());
+        }
+        crate::color_cmds::convert_document(doc, &self.profile, self.intent, self.bpc)
+    }
+
+    /// `doc` converted into this target and flattened to one frame.
+    fn frame(&self, name: &str, mut doc: Document) -> Result<Surface> {
+        self.adopt(name, &mut doc)?;
+        Ok(crate::file_cmds::flattened(&doc, self.fmt))
+    }
 }
 
 /// Import options for footage files. A test scope may lower the PSD/layered-TIFF memory limit,
@@ -387,7 +584,8 @@ fn tiff_page_error(display: &std::path::Path, name: &str, page: usize, error: ph
 
 /// Footage being decoded: the frames kept so far, the frame delays of animated files and the
 /// storage the frames take, checked against the frame and memory limits as each frame arrives.
-struct FootageBuilder {
+struct FootageBuilder<'a> {
+    target: &'a FootageTarget,
     frames: Vec<Surface>,
     delays: Vec<u32>,
     /// Each frame stores whole tiles however little it draws, so count the tiles kept so far.
@@ -395,11 +593,14 @@ struct FootageBuilder {
     max_bytes: u64,
     /// Files added; only a lone GIF or WebP says how fast it plays.
     files: usize,
+    /// Frames the import is known to bring (one per file of a sequence), so the first frame's size
+    /// can refuse it at once: "54 frames need 3159 MiB, the limit is 2048 MiB". 0 when unknown.
+    expected: usize,
 }
 
-impl FootageBuilder {
-    fn new() -> Self {
-        Self { frames: Vec::new(), delays: Vec::new(), kept_bytes: 0, max_bytes: footage_byte_limit(), files: 0 }
+impl<'a> FootageBuilder<'a> {
+    fn new(target: &'a FootageTarget, expected: usize) -> Self {
+        Self { target, frames: Vec::new(), delays: Vec::new(), kept_bytes: 0, max_bytes: target.max_bytes, files: 0, expected }
     }
 
     /// Keep one decoded frame, or say which limit it would pass.
@@ -409,9 +610,22 @@ impl FootageBuilder {
             return Err(format!("the footage has more than {} frames", crate::timeline_cmds::MAX_DURATION));
         }
         let tile = u64::from(photocraft_geom::TILE_SIZE.unsigned_abs()).pow(2) * surface.format().bytes_per_pixel() as u64;
-        self.kept_bytes = self.kept_bytes.saturating_add(tile.saturating_mul(surface.tile_count() as u64));
+        let bytes = tile.saturating_mul(surface.tile_count() as u64);
+        if self.frames.is_empty() && self.expected > 1 {
+            // The whole sequence, from its first frame: refused before the rest is decoded.
+            let need = bytes.saturating_mul(self.expected as u64);
+            if need > self.max_bytes {
+                return Err(over_limit(self.expected, need, self.max_bytes));
+            }
+            check_footage_room(self.expected, need)?;
+        }
+        self.kept_bytes = self.kept_bytes.saturating_add(bytes);
         if self.kept_bytes > self.max_bytes {
-            return Err(format!("the footage needs more than {} MiB of frames", self.max_bytes >> 20));
+            return Err(format!(
+                "the footage needs more than {} MiB of frames: {}",
+                self.max_bytes >> 20,
+                over_limit(self.frames.len() + 1, self.kept_bytes, self.max_bytes)
+            ));
         }
         self.frames.push(surface);
         Ok(())
@@ -421,14 +635,8 @@ impl FootageBuilder {
     /// full-resolution page of a multi-page TIFF, else the image itself. `display` names the
     /// file in errors and its extension picks the Targa handling; `name` is what the importers
     /// see.
-    fn add_file(
-        &mut self,
-        display: &std::path::Path,
-        name: &str,
-        bytes: &[u8],
-        fmt: photocraft_color::PixelFormat,
-        opts: &photocraft_io::ImportOptions,
-    ) -> Result<()> {
+    fn add_file(&mut self, display: &std::path::Path, name: &str, bytes: &[u8], opts: &photocraft_io::ImportOptions) -> Result<()> {
+        let target = self.target;
         self.files += 1;
         // A GIF (a still one is its only frame) or an animated WebP brings every frame.
         let animation = match photocraft_codecs::detect(bytes) {
@@ -439,7 +647,14 @@ impl FootageBuilder {
         if let Some(import) = animation {
             let mut over = None;
             let done = import(name, bytes, &mut |doc, delay_ms| {
-                if let Err(msg) = self.keep(crate::file_cmds::flattened(&doc, fmt)) {
+                let frame = match target.frame(name, doc) {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        over = Some(e.to_string());
+                        return Err(photocraft_io::IoError::Cancelled);
+                    }
+                };
+                if let Err(msg) = self.keep(frame) {
                     over = Some(msg);
                     return Err(photocraft_io::IoError::Cancelled);
                 }
@@ -475,7 +690,8 @@ impl FootageBuilder {
                     // The page is flattened before admission of the next one, so the retained
                     // frames of every page count against the footage limit, as GIF and WebP
                     // frames do.
-                    self.keep(crate::file_cmds::flattened(&doc, fmt)).map_err(|msg| EngineError::Other(format!("`{}`: {msg}", display.display())))?;
+                    let frame = target.frame(name, doc)?;
+                    self.keep(frame).map_err(|msg| EngineError::Other(format!("`{}`: {msg}", display.display())))?;
                 }
                 return Ok(());
             }
@@ -485,7 +701,8 @@ impl FootageBuilder {
         if display.extension().is_some_and(|e| e.eq_ignore_ascii_case("tga")) {
             photocraft_io::tga_alpha_channel_to_transparency(&mut doc);
         }
-        self.keep(crate::file_cmds::flattened_checked(&doc, fmt, "layer.videoLayers.newVideoLayerFromFile")?)
+        target.adopt(name, &mut doc)?;
+        self.keep(crate::file_cmds::flattened_checked(&doc, target.fmt, "layer.videoLayers.newVideoLayerFromFile")?)
             .map_err(|msg| EngineError::Other(format!("`{}`: {msg}", display.display())))
     }
 
@@ -498,8 +715,8 @@ impl FootageBuilder {
 
 /// Load frames from `path`: a single image (1 frame, or every frame of an animated GIF or WebP), or a
 /// directory of images (sorted = an image sequence). Each becomes a full raster frame in the
-/// document's format.
-fn load_frames(path: &str, fmt: photocraft_color::PixelFormat, opts: &photocraft_io::ImportOptions) -> Result<Footage> {
+/// target document's format and colour profile.
+fn load_frames(path: &str, target: &FootageTarget, opts: &photocraft_io::ImportOptions) -> Result<Footage> {
     let p = std::path::Path::new(path);
     let files: Vec<std::path::PathBuf> = if p.is_dir() {
         let mut v: Vec<_> = std::fs::read_dir(p)
@@ -515,10 +732,10 @@ fn load_frames(path: &str, fmt: photocraft_color::PixelFormat, opts: &photocraft
     if files.is_empty() {
         return Err(EngineError::Other(format!("no images in `{path}`")));
     }
-    let mut footage = FootageBuilder::new();
+    let mut footage = FootageBuilder::new(target, files.len());
     for f in &files {
         let bytes = std::fs::read(f).map_err(|e| EngineError::Other(format!("read `{}`: {e}", f.display())))?;
-        footage.add_file(f, &f.to_string_lossy(), &bytes, fmt, opts)?;
+        footage.add_file(f, &f.to_string_lossy(), &bytes, opts)?;
     }
     Ok(footage.finish())
 }
@@ -536,7 +753,8 @@ fn is_footage_image(f: &std::path::Path) -> bool {
 /// then the rate the footage implies, then 30.
 fn insert_video_layer(s: &mut Session, footage: Footage, fps: Option<f32>, name: &str, source: String) -> Result<Value> {
     let Footage { frames, fps: footage_fps } = footage;
-    let fps = fps.or(footage_fps).unwrap_or(30.0);
+    let named_fps = fps;
+    let fps = named_fps.or(footage_fps).unwrap_or(30.0);
     let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
     let n = frames.len();
     let id = s.edit("New Video Layer from File", |doc, active| {
@@ -545,6 +763,11 @@ fn insert_video_layer(s: &mut Session, footage: Footage, fps: Option<f32>, name:
             doc.timeline = Some(Timeline::new(n, fps));
         } else if let Some(t) = &mut doc.timeline {
             grow_duration(t, n);
+            // A rate the caller names is the footage's real one: the timeline plays at it, rather
+            // than keeping the rate an earlier layer or Create Video Timeline gave it.
+            if let Some(rate) = named_fps {
+                t.fps = rate;
+            }
         }
         let name = doc.next_layer_name(name);
         let mut l = Layer::raster(name, fmt);
@@ -571,19 +794,21 @@ fn new_from_file(s: &mut Session, p: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| EngineError::BadParams { cmd: "layer.videoLayers.newVideoLayerFromFile".into(), msg: "need `path`".into() })?
         .to_string();
-    let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
-    let footage = load_frames(&path, fmt, &footage_import_options(s))?;
+    let target = FootageTarget::of(s, None)?;
+    let footage = load_frames(&path, &target, &footage_import_options(s))?;
     let fps = crate::timeline_cmds::fps_param("layer.videoLayers.newVideoLayerFromFile", p)?;
     let name = std::path::Path::new(&path).file_stem().and_then(|s| s.to_str()).unwrap_or("Video").to_string();
     insert_video_layer(s, footage, fps, &name, path)
 }
 
 /// The control channel's capability-scoped New Video Layer from File (`app.newVideoLayer`):
-/// `p` is `{"paths": [str, …], "fps": number?, "name": str?}`, one footage file per path in
-/// the order given (the caller sorts a sequence); an animated GIF or WebP or a multi-page TIFF
-/// brings all its frames. Every file is read with `read`, which resolves the path beneath the
-/// automation read roots, never an ambient path. Same layer, timeline and limits as
-/// `layer.videoLayers.newVideoLayerFromFile`; the reply is `{layer, frames}`.
+/// `p` is `{"paths": [str, …], "fps": number?, "name": str?, "memoryLimitMB": int?}`, one
+/// footage file per path in the order given (the caller sorts a sequence); an animated GIF or
+/// WebP or a multi-page TIFF brings all its frames. Every file is read with `read`, which resolves
+/// the path beneath the automation read roots, never an ambient path. Same layer, timeline and
+/// limits as `layer.videoLayers.newVideoLayerFromFile`, except that `memoryLimitMB` (1 to
+/// [`MAX_FOOTAGE_LIMIT_MB`]) replaces the footage limit for this import; the reply is
+/// `{layer, frames}`.
 pub fn new_video_layer_from_reader(
     s: &mut Session,
     p: &Value,
@@ -605,13 +830,30 @@ pub fn new_video_layer_from_reader(
         Some(_) => return Err(bad("`name` must be a non-empty string")),
     };
     let fps = crate::timeline_cmds::fps_param(CMD, p)?;
-    let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
+    let flag = |key: &str, default: bool| match p.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(bad(&format!("`{key}` must be true or false"))),
+    };
+    let (center, fit) = (flag("center", true)?, flag("fit", false)?);
+    let limit_mb = match p.get("memoryLimitMB") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .filter(|mb| (1..=MAX_FOOTAGE_LIMIT_MB).contains(mb))
+                .ok_or_else(|| bad(&format!("`memoryLimitMB` must be a whole number of MiB from 1 to {MAX_FOOTAGE_LIMIT_MB}")))?,
+        ),
+    };
+    let canvas = s.active().ok_or(EngineError::NoDocument)?.doc.bounds();
+    let target = FootageTarget::of(s, limit_mb)?;
     let opts = footage_import_options(s);
-    let mut footage = FootageBuilder::new();
+    let mut builder = FootageBuilder::new(&target, paths.len());
     for path in &paths {
         let bytes = read(path).map_err(|e| EngineError::Other(format!("read `{path}`: {e}")))?;
-        footage.add_file(std::path::Path::new(path), path, &bytes, fmt, &opts)?;
+        builder.add_file(std::path::Path::new(path), path, &bytes, &opts)?;
     }
+    let mut footage = builder.finish();
+    place_footage(&mut footage.frames, canvas, center, fit);
     let first = std::path::Path::new(paths[0]);
     // A sequence keeps its folder as the footage source (what Replace Footage and Reload Frame
     // read), a single file itself.
@@ -620,7 +862,42 @@ pub fn new_video_layer_from_reader(
         _ => paths[0].to_string(),
     };
     let name = name.unwrap_or_else(|| first.file_stem().and_then(|s| s.to_str()).unwrap_or("Video").to_string());
-    insert_video_layer(s, footage.finish(), fps, &name, source)
+    insert_video_layer(s, footage, fps, &name, source)
+}
+
+/// Where `app.newVideoLayer` puts its footage, as Place does: `fit` scales every frame, keeping
+/// its aspect, to fit inside `canvas`; `center` (or `fit`) then centres the first frame's pixels
+/// on it. Every frame moves and scales the same way, so a sequence stays registered.
+fn place_footage(frames: &mut [Surface], canvas: photocraft_geom::Rect, center: bool, fit: bool) {
+    use photocraft_algo::resample::{Resample, resize_surface, scaled_rect};
+    let Some(mut bounds) = frames.first().map(Surface::content_bounds) else { return };
+    if bounds.is_empty() || canvas.is_empty() {
+        return;
+    }
+    if fit {
+        let scale = (f64::from(canvas.width()) / f64::from(bounds.width())).min(f64::from(canvas.height()) / f64::from(bounds.height()));
+        if scale.is_finite() && scale > 0.0 && (scale - 1.0).abs() > 1e-6 {
+            for frame in frames.iter_mut() {
+                *frame = resize_surface(frame, scale, scale, Resample::BicubicAutomatic);
+            }
+            bounds = scaled_rect(bounds, scale, scale);
+        }
+    }
+    if !(center || fit) {
+        return;
+    }
+    // Widened: canvas and footage edges can be anywhere in i32.
+    let offset = |lo: i32, size: u32, at: i32, own: u32| {
+        let d = i64::from(lo) + (i64::from(size) - i64::from(own)) / 2 - i64::from(at);
+        i32::try_from(d).unwrap_or(0)
+    };
+    let dx = offset(canvas.x0, canvas.width(), bounds.x0, bounds.width());
+    let dy = offset(canvas.y0, canvas.height(), bounds.y0, bounds.height());
+    if dx != 0 || dy != 0 {
+        for frame in frames.iter_mut() {
+            *frame = frame.translated(dx, dy, frame.content_bounds());
+        }
+    }
 }
 
 fn replace_footage(s: &mut Session, p: &Value) -> Result<Value> {
@@ -629,8 +906,8 @@ fn replace_footage(s: &mut Session, p: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| EngineError::BadParams { cmd: "layer.videoLayers.replaceFootage".into(), msg: "need `path`".into() })?
         .to_string();
-    let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
-    let frames = load_frames(&path, fmt, &footage_import_options(s))?.frames;
+    let target = FootageTarget::of(s, None)?;
+    let frames = load_frames(&path, &target, &footage_import_options(s))?.frames;
     edit_video(s, "Replace Footage", move |v, _| {
         v.original_frames = Some(frames.clone());
         v.frames = frames;
@@ -651,7 +928,7 @@ fn interpret_footage(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn reload_frame(s: &mut Session, _p: &Value) -> Result<Value> {
     // Reload the whole stack from its file source (what a frame reload needs for a sequence).
-    let (src, fmt) = {
+    let src = {
         let st = s.active().ok_or(EngineError::NoDocument)?;
         let id = st.active_layer.ok_or(EngineError::NoDocument)?;
         let v = st
@@ -659,14 +936,15 @@ fn reload_frame(s: &mut Session, _p: &Value) -> Result<Value> {
             .layer(id)
             .and_then(|l| l.video.as_ref())
             .ok_or_else(|| EngineError::BadParams { cmd: "layer.videoLayers.reloadFrame".into(), msg: "not a video layer".into() })?;
-        (v.source.clone(), st.doc.pixel_format())
+        v.source.clone()
     };
+    let target = FootageTarget::of(s, None)?;
     let photocraft_doc::VideoSource::File { path } = src else {
         return Err(EngineError::BadParams { cmd: "layer.videoLayers.reloadFrame".into(), msg: "this layer has no file source to reload".into() });
     };
     // The footage path is stored in the document.
     let file = crate::doc_path::resolve(&path).map_err(|why| crate::doc_path::refusal("the footage", &path, why))?;
-    let frames = load_frames(&file.to_string_lossy(), fmt, &footage_import_options(s))?.frames;
+    let frames = load_frames(&file.to_string_lossy(), &target, &footage_import_options(s))?.frames;
     edit_video(s, "Reload Frame", move |v, _| {
         v.original_frames = Some(frames.clone());
         v.frames = frames;
@@ -690,8 +968,9 @@ fn frames_to_layers(s: &mut Session, p: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| EngineError::BadParams { cmd: "file.import.videoFramesToLayers".into(), msg: "need `path`".into() })?
         .to_string();
-    let fmt = s.active().ok_or(EngineError::NoDocument)?.doc.pixel_format();
-    let frames = load_frames(&path, fmt, &footage_import_options(s))?.frames;
+    let target = FootageTarget::of(s, None)?;
+    let fmt = target.fmt;
+    let frames = load_frames(&path, &target, &footage_import_options(s))?.frames;
     let n = frames.len();
     s.edit("Video Frames to Layers", |doc, active| {
         let mut above = *active;

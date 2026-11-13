@@ -358,6 +358,54 @@ fn frames_to_layers_and_render_video() {
 }
 
 #[test]
+fn render_video_writes_png_jpg_and_exr_frames() {
+    let dir = tmpdir("fmtsrc");
+    write_png(&format!("{dir}/a.png"), 10, 8, "#ff0000");
+    write_png(&format!("{dir}/b.png"), 10, 8, "#00ff00");
+    let mut s = session();
+    s.execute("layer.videoLayers.newVideoLayerFromFile", json!({"path": dir})).unwrap();
+    // The Timeline panel offers these three; each frame is a file of that format.
+    for (format, magic) in [("png", &b"\x89PNG"[..]), ("jpg", &b"\xFF\xD8\xFF"[..]), ("exr", &b"\x76\x2F\x31\x01"[..])] {
+        let out = tmpdir(&format!("fmtout-{format}"));
+        let r = s.execute("file.export.renderVideo", json!({"dir": out, "format": format})).unwrap();
+        assert_eq!(r["frames"], 2, "{format}: {r}");
+        let mut frames: Vec<_> = std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()).collect();
+        frames.sort();
+        assert_eq!(frames.len(), 2, "{format}: {frames:?}");
+        for frame in &frames {
+            assert_eq!(frame.extension().and_then(|e| e.to_str()), Some(format), "{frame:?}");
+            let bytes = std::fs::read(frame).unwrap();
+            assert!(bytes.starts_with(magic), "{format}: {frame:?} is not a {format} file");
+        }
+        std::fs::remove_dir_all(&out).unwrap();
+    }
+}
+
+#[test]
+fn psd_export_warns_that_the_timeline_and_video_frames_are_dropped() {
+    let opts = photocraft_io::ExportOptions::default();
+    let warned = |doc: &photocraft_doc::Document, ext: &str| {
+        photocraft_io::export(doc, ext, &opts).unwrap().warnings.iter().any(|w| w == photocraft_io::ANIMATION_DROPPED)
+    };
+    let mut s = session();
+    assert!(!warned(&s.active().unwrap().doc, "psd"), "a still document saves without the warning");
+
+    let dir = tmpdir("psdwarn");
+    write_png(&format!("{dir}/a.png"), 6, 4, "#ff0000");
+    write_png(&format!("{dir}/b.png"), 6, 4, "#00ff00");
+    s.execute("layer.videoLayers.newVideoLayerFromFile", json!({"path": dir})).unwrap();
+    let doc: &photocraft_doc::Document = &s.active().unwrap().doc;
+    assert!(doc.has_animation());
+    assert!(warned(doc, "psd") && warned(doc, "psb"), "PSD and PSB say the frames are lost");
+    assert!(!warned(doc, "pcraft"), ".pcraft keeps every frame");
+
+    // A timeline alone (no video layer yet) is lost too.
+    let mut s = session();
+    s.execute("timeline.create", json!({"duration": 4, "fps": 24.0})).unwrap();
+    assert!(warned(&s.active().unwrap().doc, "psd"));
+}
+
+#[test]
 fn render_video_to_animated_gif() {
     let dir = tmpdir("gifsrc");
     write_png(&format!("{dir}/a.png"), 10, 8, "#ff0000");
@@ -550,7 +598,7 @@ fn tga_sequence_frames_keep_their_transparency() {
     write_tga(&format!("{dir}/f02.tga"));
     let frames = load_frames(
         &dir,
-        photocraft_color::PixelFormat::new(photocraft_color::ColorMode::Rgb, photocraft_color::SampleType::U8, true),
+        &FootageTarget::raw(photocraft_color::PixelFormat::new(photocraft_color::ColorMode::Rgb, photocraft_color::SampleType::U8, true)),
         &photocraft_io::ImportOptions::default(),
     )
     .unwrap()
@@ -1011,12 +1059,155 @@ fn video_layer_from_reader_reads_every_frame_in_order() {
     let id = LayerId(r["layer"].as_u64().unwrap());
     let doc = &s.active().unwrap().doc;
     let layer = doc.layer(id).unwrap();
-    assert_eq!(layer.name, "plateMain");
+    // Numbered as every new layer is ("plateMain 1"); integrations rename it exactly.
+    assert!(layer.name.starts_with("plateMain"), "{}", layer.name);
     let video = layer.video.as_ref().unwrap();
     assert_eq!(video.frames.len(), 3);
     assert!(matches!(&video.source, photocraft_doc::VideoSource::File { path } if path == "shot"));
     let timeline = doc.timeline.as_ref().unwrap();
     assert_eq!((timeline.duration, timeline.fps), (3, 24.0));
+}
+
+/// The footage limit: the command's `memoryLimitMB`, else `PHOTOCRAFT_FOOTAGE_BUDGET_MB`, else the
+/// preference (0 is automatic), else a share of RAM; never more than 100 GiB, and the environment
+/// variable is ignored unless it is a positive whole number.
+#[test]
+fn footage_limit_takes_param_then_env_then_pref_then_ram() {
+    use FootageLimitSource::*;
+    assert_eq!(resolve_footage_limit_mb(Some(8192), Some("4096"), 1024, 2048), (8192, Param));
+    assert_eq!(resolve_footage_limit_mb(None, Some("4096"), 1024, 2048), (4096, Env));
+    assert_eq!(resolve_footage_limit_mb(None, Some(" 999999 "), 0, 2048), (MAX_FOOTAGE_LIMIT_MB, Env));
+    for junk in ["", "0", "-5", "8GB"] {
+        assert_eq!(resolve_footage_limit_mb(None, Some(junk), 1024, 2048), (1024, Pref), "{junk:?}");
+    }
+    assert_eq!(resolve_footage_limit_mb(None, None, 0, 5000), (5000, Automatic));
+    // 62 GiB at the default 70 % Memory Usage; unknown RAM (the web) keeps the old 2 GiB.
+    assert_eq!(automatic_footage_limit_mb(Some(62 << 30), None), 634 * 70);
+    assert_eq!(automatic_footage_limit_mb(Some(62 << 30), Some(50)), 634 * 50);
+    assert_eq!(automatic_footage_limit_mb(None, Some(70)), 2048);
+    assert_eq!(automatic_footage_limit_mb(Some(1 << 30), Some(70)), 2048, "never below the old fixed limit");
+    assert_eq!(automatic_footage_limit_mb(Some(1 << 40), Some(95)), MAX_FOOTAGE_LIMIT_MB);
+}
+
+/// `app.newVideoLayer` refuses a sequence over `memoryLimitMB` from its first frame, naming the
+/// frames, the memory they need and the limit, and leaves the document as it was; a bad
+/// `memoryLimitMB` is a parameter error, and the limit is also what `app.footageBudget` reports.
+#[test]
+fn video_layer_from_reader_refuses_a_sequence_over_its_limit_up_front() {
+    // 16 × 12 RGBA 8-bit: one 256 × 256 tile, 256 KiB a frame, so 5 frames need 1.25 MiB.
+    let reads = std::cell::Cell::new(0);
+    let mut read = |_: &str| -> std::result::Result<Vec<u8>, String> {
+        reads.set(reads.get() + 1);
+        Ok(png_bytes(16, 12, "#808080"))
+    };
+    let mut s = session();
+    let before = s.active().unwrap().doc.layers.len();
+    let paths = ["f.1001.png", "f.1002.png", "f.1003.png", "f.1004.png", "f.1005.png"];
+    let err = new_video_layer_from_reader(&mut s, &json!({"paths": paths, "memoryLimitMB": 1}), &mut read).unwrap_err().to_string();
+    assert!(err.contains("5 frames need 2 MiB, the limit is 1 MiB"), "{err}");
+    assert_eq!(reads.get(), 1, "refused from the first frame, the rest isn't decoded");
+    assert_eq!(s.active().unwrap().doc.layers.len(), before, "nothing imported");
+    for bad in [json!(0), json!(MAX_FOOTAGE_LIMIT_MB + 1), json!("2048"), json!(1.5)] {
+        let err = new_video_layer_from_reader(&mut s, &json!({"paths": paths, "memoryLimitMB": bad}), &mut read).unwrap_err();
+        assert!(matches!(err, EngineError::BadParams { .. }), "{bad}: {err}");
+    }
+    // Within the limit it loads.
+    let r = new_video_layer_from_reader(&mut s, &json!({"paths": paths, "memoryLimitMB": 2}), &mut read).unwrap();
+    assert_eq!(r["frames"], 5);
+    let info = footage_budget_info(&s);
+    assert_eq!(info["maxMB"], MAX_FOOTAGE_LIMIT_MB);
+    assert_eq!(info["env"], FOOTAGE_BUDGET_ENV);
+    assert!(info["limitMB"].as_u64().unwrap() >= 1, "{info}");
+}
+
+/// EXR footage is scene-linear. Loaded into 8, 16 and 32-bit documents it is converted into the
+/// document's profile, so exporting the document to EXR gives the source values back (above 1.0
+/// too at 32 bits; 8 and 16 bits clip them), and a PNG is display-encoded (sRGB). Before, the
+/// linear values were stored unconverted in the sRGB document and EXR export decoded them as sRGB
+/// once more: 0.46 came back as 0.178 and 1.621 as 3.037, and JPG/PNG came out dark.
+#[test]
+fn exr_footage_round_trips_through_the_document_profile() {
+    use photocraft_codecs::{ChannelLayout, Format, Image, SampleType as CSample};
+    let (w, h) = (16usize, 12usize);
+    let levels = [0.10f32, 0.46, 0.91, 1.621];
+    let mut samples = Vec::with_capacity(w * h * 4);
+    for i in 0..w * h {
+        let v = levels[i % levels.len()];
+        samples.extend_from_slice(&[v, v * 0.5, 0.25, 1.0]);
+    }
+    let image = Image::from_f32(w as u32, h as u32, ChannelLayout::Rgba, &samples).unwrap();
+    let exr = photocraft_codecs::encode(&image, Format::OpenExr, &Default::default()).unwrap();
+    let srgb = |v: f32| if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+    for (depth, tolerance) in [(8u32, 0.01f32), (16, 1e-3), (32, 1e-3)] {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": w, "height": h, "depth": depth})).unwrap();
+        let mut read = |_: &str| -> std::result::Result<Vec<u8>, String> { Ok(exr.clone()) };
+        new_video_layer_from_reader(&mut s, &json!({"paths": ["f.1001.exr", "f.1002.exr"]}), &mut read).unwrap();
+        let doc = &s.active().unwrap().doc;
+        let decoded = |ext: &str| {
+            let bytes = photocraft_io::export(doc, ext, &photocraft_io::ExportOptions::default()).unwrap().bytes;
+            photocraft_codecs::decode(&bytes).unwrap().convert(ChannelLayout::Rgba, CSample::F32).to_f32_samples().unwrap()
+        };
+        let got = decoded("exr");
+        assert_eq!(got.len(), samples.len());
+        for (i, (g, want)) in got.iter().zip(&samples).enumerate() {
+            let want = if depth == 32 { *want } else { want.min(1.0) };
+            assert!((g - want).abs() < tolerance, "{depth}-bit EXR sample {i}: {g} != {want}");
+        }
+        let png = decoded("png");
+        for (i, (g, want)) in png.iter().zip(&samples).enumerate() {
+            let want = if i % 4 == 3 { *want } else { srgb(want.min(1.0)) };
+            assert!((g - want).abs() < 2.5 / 255.0, "{depth}-bit PNG sample {i}: {g} != {want} (display-encoded)");
+        }
+    }
+}
+
+/// `app.newVideoLayer` centres footage on the canvas (as Place does) unless `center: false`, and
+/// `fit` scales it to fit first; every frame moves together.
+#[test]
+fn video_layer_from_reader_centres_or_fits_the_footage() {
+    let mut read = |path: &str| -> std::result::Result<Vec<u8>, String> { Ok(png_bytes(4, 4, if path.ends_with("1.png") { "#ff0000" } else { "#00ff00" })) };
+    let frames_of = |s: &Session, r: &Value| -> Vec<photocraft_geom::Rect> {
+        let id = LayerId(r["layer"].as_u64().unwrap());
+        s.active().unwrap().doc.layer(id).unwrap().video.as_ref().unwrap().frames.iter().map(Surface::content_bounds).collect()
+    };
+    let paths = json!(["f.1.png", "f.2.png"]);
+    // The canvas is 16 × 12.
+    let mut s = session();
+    let r = new_video_layer_from_reader(&mut s, &json!({"paths": paths}), &mut read).unwrap();
+    assert_eq!(frames_of(&s, &r), [photocraft_geom::Rect::new(6, 4, 10, 8); 2], "centred by default");
+
+    let mut s = session();
+    let r = new_video_layer_from_reader(&mut s, &json!({"paths": paths, "center": false}), &mut read).unwrap();
+    assert_eq!(frames_of(&s, &r), [photocraft_geom::Rect::new(0, 0, 4, 4); 2], "where the file puts it");
+
+    let mut s = session();
+    let r = new_video_layer_from_reader(&mut s, &json!({"paths": paths, "fit": true}), &mut read).unwrap();
+    for b in frames_of(&s, &r) {
+        // Scaled 3× to the canvas height (the resampling filter softens a pixel or two at each
+        // edge), centred.
+        assert!((11..=18).contains(&b.height()) && (11..=18).contains(&b.width()), "{b:?}");
+        assert!(((b.x0 + b.x1) - 16).abs() <= 1 && ((b.y0 + b.y1) - 12).abs() <= 1, "{b:?}");
+    }
+
+    let mut s = session();
+    for bad in [json!({"paths": paths, "center": "yes"}), json!({"paths": paths, "fit": 1})] {
+        assert!(new_video_layer_from_reader(&mut s, &bad, &mut read).is_err(), "{bad}");
+    }
+}
+
+/// Footage loaded with its real rate into a document whose timeline was made at another one plays
+/// at the footage's rate; footage without a named rate leaves the timeline's alone.
+#[test]
+fn a_named_fps_sets_the_rate_of_an_existing_timeline() {
+    let mut read = |_: &str| -> std::result::Result<Vec<u8>, String> { Ok(png_bytes(16, 12, "#ff0000")) };
+    let mut s = session();
+    s.execute("timeline.create", json!({"duration": 10, "fps": 30.0})).unwrap();
+    new_video_layer_from_reader(&mut s, &json!({"paths": ["a.png", "b.png"], "fps": 24.0}), &mut read).unwrap();
+    let t = s.active().unwrap().doc.timeline.clone().unwrap();
+    assert_eq!((t.fps, t.duration), (24.0, 10), "the rate follows; a longer timeline keeps its length");
+    new_video_layer_from_reader(&mut s, &json!({"paths": ["c.png"]}), &mut read).unwrap();
+    assert_eq!(s.active().unwrap().doc.timeline.as_ref().unwrap().fps, 24.0);
 }
 
 /// Hostile params and an unreadable frame are errors that change nothing, never a panic.

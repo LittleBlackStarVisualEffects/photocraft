@@ -1135,6 +1135,12 @@ impl Document {
         health
     }
 
+    /// Whether the document has a timeline or a video layer. PSD, PSB and the flat formats store
+    /// neither, so they keep only the frame at the playhead; `.pcraft` keeps every frame.
+    pub fn has_animation(&self) -> bool {
+        self.timeline.is_some() || self.walk().iter().any(|(_, _, layer)| layer.video.is_some())
+    }
+
     /// Depth-first walk yielding `(path, depth, layer)` bottom-to-top.
     pub fn walk(&self) -> Vec<(LayerPath, usize, &Layer)> {
         fn rec<'a>(layers: &'a [Layer], prefix: &mut LayerPath, out: &mut Vec<(LayerPath, usize, &'a Layer)>) {

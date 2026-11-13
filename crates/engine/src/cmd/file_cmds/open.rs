@@ -144,7 +144,13 @@ pub(super) fn revert(s: &mut Session) -> Result<Value> {
 /// linear) — the working space ACES render pipelines write. Only the io default is
 /// replaced; an embedded or EXIF-declared profile is kept untouched.
 pub(crate) fn tag_exr_colorspace(s: &Session, name: &str, doc: &mut Document) {
-    if !name.to_ascii_lowercase().ends_with(".exr") || !s.prefs.get().file_handling.exr_aces_cg {
+    tag_exr_colorspace_with(s.prefs.get().file_handling.exr_aces_cg, name, doc);
+}
+
+/// [`tag_exr_colorspace`] with the ACEScg option given, for footage decoded while the session is
+/// otherwise borrowed.
+pub(crate) fn tag_exr_colorspace_with(aces_cg: bool, name: &str, doc: &mut Document) {
+    if !name.to_ascii_lowercase().ends_with(".exr") || !aces_cg {
         return;
     }
     let linear = photocraft_cms::Builtin::LinearSrgb.profile().to_bytes();

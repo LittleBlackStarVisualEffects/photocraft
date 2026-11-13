@@ -59,6 +59,11 @@ pub(crate) struct LaunchArgs {
     /// collects it over the control channel (host.events)
     #[arg(long, value_name = "FILE", env = "PHOTOCRAFT_HOST_MENU")]
     pub(crate) host_menu: Option<PathBuf>,
+    /// Never check for updates or offer one, for a build that a studio or pipeline installs (the
+    /// variable: 0, false, no or off is off; empty is unset). Help › Check for Updates then reports
+    /// that checks are unavailable
+    #[arg(long, env = "PHOTOCRAFT_NO_UPDATE_CHECK", value_parser = FalseyValueParser::new())]
+    pub(crate) no_update_check: bool,
     #[command(flatten)]
     pub(crate) auth: ControlArgs,
     #[command(flatten)]
@@ -319,6 +324,14 @@ mod tests {
         let parsed = parse_args(&["--control-token-file", "/tmp/token", "--new-instance"]).unwrap();
         assert_eq!(parsed.auth.control_token_file.as_deref(), Some(std::path::Path::new("/tmp/token")));
         assert!(parsed.launch_options.is_empty() && !parsed.in_window_menus, "{:?}", parsed.launch_options);
+        assert!(!parsed.no_update_check, "update checks stay on unless asked");
+    }
+
+    #[test]
+    fn no_update_check_flag_turns_checks_off() {
+        assert!(parse_args(&["--no-update-check"]).unwrap().no_update_check);
+        // A launch-wide choice of the pipeline, not one that keeps a process of its own.
+        assert!(parse_args(&["--no-update-check"]).unwrap().launch_options.is_empty());
     }
 
     #[test]

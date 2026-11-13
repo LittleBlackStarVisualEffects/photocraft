@@ -49,6 +49,8 @@ pub fn kind_label(layer: &Layer) -> String {
     match &layer.content {
         LayerContent::Adjustment(a) => a.label().to_string(),
         LayerContent::Group(g) if g.artboard.is_some() => "Artboard".to_string(),
+        // Pixels that change with the timeline (Layer › Video Layers).
+        LayerContent::Raster(_) if layer.video.is_some() => "Video Layer".to_string(),
         other => format!("{} Layer", other.kind_name()),
     }
 }

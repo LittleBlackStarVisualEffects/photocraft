@@ -13,7 +13,7 @@ use photocraft_automation::security::{
     read_bounded_line, repeat_auth_reply,
 };
 use photocraft_ui_egui::ControlRequest;
-use photocraft_ui_egui::control::REPLY_DEADLINE;
+use photocraft_ui_egui::control::reply_deadline;
 use serde_json::{Value, json};
 
 /// Start serving a listener already bound during startup, before a window is opened.
@@ -105,7 +105,7 @@ fn serve_with_auth_deadline(stream: TcpStream, token: &str, tx: Sender<ControlRe
                 let id = msg.get("id").cloned().unwrap_or(Value::Null);
                 let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
                 let params = msg.get("params").cloned().unwrap_or(json!({}));
-                let deadline = Instant::now() + REPLY_DEADLINE;
+                let deadline = Instant::now() + reply_deadline(&method);
                 let (mut req, rrx) = ControlRequest::new(method, params);
                 req.deadline = Some(deadline);
                 let dispatch = req.dispatch.clone();

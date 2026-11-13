@@ -83,6 +83,10 @@ pub(super) fn humanize(key: &str) -> String {
     if key == "gpuMemoryMb" {
         return "GPU Memory (MB, 0 = Automatic)".into();
     }
+    // Performance: what one footage import (New Video Layer from File) may hold.
+    if key == "footageMemoryLimitMb" {
+        return "Footage Memory Limit (MB, 0 = Automatic)".into();
+    }
     let mut s = String::new();
     for (i, ch) in key.chars().enumerate() {
         if i == 0 {

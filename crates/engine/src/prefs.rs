@@ -751,6 +751,11 @@ pub struct Performance {
     /// Memory budget of the layer-effect cache, in MB.
     pub effect_cache_mb: u32,
     pub legacy_compositing: bool,
+    /// Memory the frames of one footage import (New Video Layer from File, `app.newVideoLayer`)
+    /// may take, in MB, up to [`crate::MAX_FOOTAGE_LIMIT_MB`] (100 GiB); 0 is automatic, the
+    /// share of RAM Memory Usage allows. Frames that don't fit in RAM go to the scratch disk like
+    /// any other tile. `PHOTOCRAFT_FOOTAGE_BUDGET_MB` overrides it for one launch.
+    pub footage_memory_limit_mb: u32,
 }
 
 impl Performance {
@@ -816,6 +821,7 @@ impl Default for Performance {
             gpu_memory_mb: 0,
             effect_cache_mb: 768,
             legacy_compositing: false,
+            footage_memory_limit_mb: 0,
         }
     }
 }

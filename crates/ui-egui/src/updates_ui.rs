@@ -17,6 +17,12 @@ pub(crate) struct Runtime {
     /// The check running was asked for with Help ▸ Check for Updates.
     #[cfg(not(target_arch = "wasm32"))]
     requested: bool,
+    /// The startup prompt was closed over the control channel (`ui.set {"updatesOpen": false}`):
+    /// it is no longer drawn, so nothing in it can start an update. `craft-update` has no call
+    /// that closes its prompt, and replacing the updater could drop an installation in progress.
+    /// A manual check shows the prompt again.
+    #[cfg(not(target_arch = "wasm32"))]
+    prompt_hidden: bool,
 }
 
 impl Default for Runtime {
@@ -30,8 +36,33 @@ impl Default for Runtime {
             last_update: craft_update::updater::Status::Idle,
             #[cfg(not(target_arch = "wasm32"))]
             requested: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            prompt_hidden: false,
         }
     }
+}
+
+/// Close the startup update prompt (`ui.set {"updatesOpen": false}`): a pipeline that ships its
+/// own build must be able to keep the public release from being offered over it.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn hide_prompt(app: &mut PhotocraftApp) {
+    app.updates_rt.prompt_hidden = true;
+}
+
+/// The web build has no startup prompt.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn hide_prompt(_app: &mut PhotocraftApp) {}
+
+/// Whether the startup update prompt is on screen (`ui.inspect` `updatePromptOpen`).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn prompt_shown(app: &PhotocraftApp) -> bool {
+    app.updates_rt.updater.prompt_open() && !app.updates_rt.prompt_hidden
+}
+
+/// The web build has no startup prompt.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn prompt_shown(_app: &PhotocraftApp) -> bool {
+    false
 }
 
 /// The release the engine found, as `craft-update` knows it.
@@ -65,6 +96,7 @@ pub(crate) fn check(app: &mut PhotocraftApp, _ctx: &egui::Context, params: Value
         #[cfg(not(target_arch = "wasm32"))]
         {
             app.updates_rt.requested = true;
+            app.updates_rt.prompt_hidden = false;
             app.updates_rt.updater.dismiss_status();
             app.updates_rt.last_update = craft_update::updater::Status::Idle;
             // A check made before the first frame leaves the last self-update's records for the
@@ -135,7 +167,9 @@ pub(crate) fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         app.updates_rt.updater.tick(ctx);
         // An update starts, and a ready one asks the app to close, only while no work is unsaved.
         let clean = !app.has_unsaved_work();
-        match app.updates_rt.updater.show_if(ctx, clean) {
+        // A hidden prompt is not drawn (`hide_prompt`), so none of its buttons can be pressed.
+        let action = if app.updates_rt.prompt_hidden { craft_update::updater::Action::None } else { app.updates_rt.updater.show_if(ctx, clean) };
+        match action {
             craft_update::updater::Action::None => {}
             craft_update::updater::Action::OpenUrl(url) => download = Some(url),
             // The guarded close path asks about unsaved work and waits for saves; the restart helper
@@ -335,6 +369,35 @@ mod tests {
         });
         output.textures_delta.clear();
         assert!(app.updates_rt.updater.prompt_open());
+    }
+
+    /// A pipeline closes the startup prompt with `ui.set {"updatesOpen": false}`: it is no longer
+    /// shown or reported, and a manual check brings it back.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn closing_the_update_window_over_the_channel_hides_the_startup_prompt() {
+        let (mut app, _, sender) = app();
+        let ctx = egui::Context::default();
+        at(&mut app, &ctx, 0.0);
+        sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(Ok(Some(Release { version: "99.0.0".into(), url: "https://github.com/storytold/photocraft/releases/tag/v99.0.0".into() })))
+            .unwrap();
+        at(&mut app, &ctx, 1.0);
+        assert!(prompt_shown(&app), "the prompt offers the release");
+
+        hide_prompt(&mut app);
+        assert!(!prompt_shown(&app), "hidden");
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| show(&mut app, ui.ctx()));
+        output.textures_delta.clear();
+        assert!(!prompt_shown(&app), "drawing doesn't bring it back");
+
+        // A manual check shows it again.
+        check(&mut app, &ctx, serde_json::json!({})).unwrap();
+        assert!(!app.updates_rt.prompt_hidden);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -1080,6 +1080,11 @@ pub fn named_for_file<'a>(doc: &'a Document, name: &str) -> std::borrow::Cow<'a,
     }
 }
 
+/// The PSD/PSB export warning for a document with a timeline or video layers: neither is stored,
+/// so each video layer is saved as the frame at the playhead.
+pub const ANIMATION_DROPPED: &str =
+    "PSD/PSB keeps no timeline: each video layer is saved as its current frame only, and the file reopens as stills. Save as .pcraft to keep every frame";
+
 /// Exports `doc` to the format named by `name_or_ext` (a file name, path or
 /// bare extension).
 pub fn export(doc: &Document, name_or_ext: &str, opts: &ExportOptions) -> Result<ExportResult, IoError> {
@@ -1251,6 +1256,10 @@ fn export_stages_with_renderer(
         ctl.check().map_err(|_| IoError::Cancelled)?;
         if !doc.metadata.text.is_empty() {
             warnings.push("free-form text metadata is not supported by PSD/PSB; it will be dropped".into());
+        }
+        // Reopened, the file would hold stills and play one frame: say so.
+        if doc.has_animation() {
+            warnings.push(ANIMATION_DROPPED.into());
         }
         warnings.extend(tiff_layers::strip_foreign_order_blocks(&mut file));
         if let Some(preview) = preview {

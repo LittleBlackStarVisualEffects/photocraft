@@ -47,6 +47,7 @@ pub const METHODS: &[&str] = &[
     "session.list",
     "doc.open",
     "doc.place",
+    "doc.newVideoLayer",
     "doc.replaceSmartObject",
     "doc.new",
     "doc.save",
@@ -157,6 +158,13 @@ impl Headless {
                 opts.remove("path");
                 opts.remove("index");
                 self.place(index_of(&p)?, path, &Value::Object(opts))
+            }
+            // An image sequence as a video layer, frames read beneath the read root (the desktop
+            // channel's `app.newVideoLayer`).
+            "doc.newVideoLayer" => {
+                let mut opts = p.as_object().cloned().unwrap_or_default();
+                opts.remove("index");
+                self.new_video_layer(index_of(&p)?, &Value::Object(opts))
             }
             "doc.replaceSmartObject" => {
                 let path = str_of(&p, "path").ok_or_else(|| bad("doc.replaceSmartObject needs `path`"))?;

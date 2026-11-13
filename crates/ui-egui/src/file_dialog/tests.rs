@@ -1418,6 +1418,35 @@ fn render_video_menu_asks_for_directory_and_writes_frames_only_after_confirmatio
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn render_video_menu_writes_the_timeline_panels_format_unless_one_is_named() {
+    let (mut app, open, _) = app();
+    let ctx = egui::Context::default();
+    let render_to = |app: &mut PhotocraftApp, params: Value, name: &str| -> Vec<String> {
+        let dir = std::env::temp_dir().join(format!("pc-render-format-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        menus::invoke(app, &ctx, "file.export.renderVideo", params).unwrap();
+        app.poll_file_dialog(&ctx, None);
+        answer(&open, Some(FileDialogAnswer::FolderTo(dir.to_string_lossy().into_owned())));
+        app.poll_file_dialog(&ctx, None);
+        let exts = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().extension().and_then(|ext| ext.to_str()).unwrap_or_default().to_string())
+            .collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        exts
+    };
+
+    // The format chosen in Window › Timeline applies to File › Export › Render Video… too.
+    app.ui.timeline.render_format = crate::timeline_ui::RenderFormat::Exr;
+    assert_eq!(render_to(&mut app, json!({}), "exr"), ["exr"]);
+    app.ui.timeline.render_format = crate::timeline_ui::RenderFormat::Jpg;
+    assert_eq!(render_to(&mut app, json!({}), "jpg"), ["jpg"]);
+    // A caller that names a format gets it, whatever the panel shows.
+    assert_eq!(render_to(&mut app, json!({"format": "png"}), "named"), ["png"]);
+}
+
 /// How many times each path was written, standing in for its size and modification time.
 type Disk = Rc<RefCell<std::collections::HashMap<String, u64>>>;
 

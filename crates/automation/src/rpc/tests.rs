@@ -468,6 +468,46 @@ fn workspace_writes_refuse_to_replace_a_file_that_is_not_an_image() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// Headless `doc.newVideoLayer` (the desktop channel's `app.newVideoLayer`): a sequence beneath the
+/// read root becomes one video layer and a timeline; a frame outside it is refused.
+#[test]
+fn doc_new_video_layer_reads_frames_through_the_read_root() {
+    let base = std::env::temp_dir().join(format!("pc-doc-video-layer-{}", std::process::id()));
+    let root = base.join("workspace");
+    let outside = base.join("outside");
+    for dir in [root.join("plate"), outside.clone()] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let png = |v: u8| {
+        let img = photocraft_codecs::Image::from_u8(8, 6, photocraft_codecs::ChannelLayout::Rgb, vec![v; 8 * 6 * 3]).unwrap();
+        photocraft_codecs::encode(&img, photocraft_codecs::Format::Png, &Default::default()).unwrap()
+    };
+    for (i, v) in [10u8, 20, 30].into_iter().enumerate() {
+        std::fs::write(root.join(format!("plate/f.{}.png", 1001 + i)), png(v)).unwrap();
+    }
+    std::fs::write(outside.join("f.png"), png(40)).unwrap();
+
+    let mut h = Headless::with_workspace(crate::AuthorizedWorkspace::new(Some(&root), Some(&root)).unwrap());
+    h.handle("doc.new", json!({"width": 8, "height": 6})).unwrap();
+    let paths = json!(["plate/f.1001.png", "plate/f.1002.png", "plate/f.1003.png"]);
+    let r = h.handle("doc.newVideoLayer", json!({"paths": paths, "fps": 24, "name": "plateMain"})).unwrap();
+    assert_eq!(r["frames"], 3, "{r}");
+    let timeline = h.handle("engine.execute", json!({"command": "timeline.info"})).unwrap();
+    assert_eq!((timeline["timeline"]["duration"].as_u64(), timeline["timeline"]["fps"].as_f64()), (Some(3), Some(24.0)), "{timeline}");
+    let listed = h.handle("engine.execute", json!({"command": "layer.list"})).unwrap();
+    let layer = listed["layers"].as_array().unwrap().iter().find(|l| l["id"] == r["layer"]).cloned().unwrap();
+    assert_eq!((layer["name"].as_str(), layer["video"]["frames"].as_u64()), (Some("plateMain"), Some(3)), "{listed}");
+
+    let absolute = outside.join("f.png").to_string_lossy().into_owned();
+    assert!(h.handle("doc.newVideoLayer", json!({"paths": [absolute]})).is_err(), "outside the read root");
+    assert!(h.handle("doc.newVideoLayer", json!({"paths": []})).is_err());
+    let unauthorized = Headless::new().handle("doc.newVideoLayer", json!({"paths": ["plate/f.1001.png"]}));
+    assert!(unauthorized.is_err(), "no document, no read authority");
+    // Release directory capabilities before cleanup on Windows.
+    drop(h);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn doc_replace_smart_object_reads_through_the_read_root_and_never_outside_it() {
     let base = std::env::temp_dir().join(format!("pc-doc-replace-so-{}", std::process::id()));

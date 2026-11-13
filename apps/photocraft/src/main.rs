@@ -402,6 +402,7 @@ fn main() -> eframe::Result {
         frame_latency,
         stroke_trace,
         host_menu,
+        no_update_check,
         control: control_port,
         auth,
         automation,
@@ -535,6 +536,12 @@ fn main() -> eframe::Result {
             let mut services = services::native(automation);
             services.preset_store = presets;
             services.host_menu = host_menu;
+            if no_update_check {
+                // A build a pipeline installs: no startup check, no prompt offering the public
+                // release over it, and no report of a self-update.
+                services.check_updates = None;
+                services.last_update = None;
+            }
             #[cfg(target_os = "linux")]
             let display = tablet::DisplayKind::of(cc);
             #[cfg(target_os = "linux")]

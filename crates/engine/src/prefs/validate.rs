@@ -121,6 +121,7 @@ pub fn range(path: &str) -> Option<(f64, f64)> {
         "performance.gpuMemoryMb" => (0.0, 1_048_576.0),
         "performance.memoryUsagePercent" => (1.0, 95.0),
         "performance.historyStates" => (1.0, 1000.0),
+        "performance.footageMemoryLimitMb" => (0.0, crate::MAX_FOOTAGE_LIMIT_MB as f64),
         "performance.cacheLevels" => (1.0, 8.0),
         "performance.cacheTileSize" => (256.0, 16384.0),
         "performance.effectCacheMb" => (f64::from(super::EFFECT_CACHE_MIN_MB), f64::from(super::effect_cache_max_mb(super::SMALL_ADDRESS_SPACE))),
