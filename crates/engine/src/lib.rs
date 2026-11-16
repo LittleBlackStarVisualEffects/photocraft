@@ -46,6 +46,7 @@ pub mod shell_commands;
 pub mod shortcut_sets;
 pub mod snap;
 pub use variables_cmds::{export_data_sets_with, import_data_sets_text};
+pub use timeline_cmds::{altered_frames, timeline_json};
 pub use video_cmds::{FOOTAGE_BUDGET_ENV, MAX_FOOTAGE_LIMIT_MB, footage_budget_info, new_video_layer_from_reader, render_video_with};
 
 use std::sync::Arc;

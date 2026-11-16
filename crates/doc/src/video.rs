@@ -70,12 +70,29 @@ pub struct Timeline {
     pub work_start: usize,
     /// Work-area end frame (exclusive).
     pub work_end: usize,
+    /// The number shown for frame 0: VFX plates start at 1001 and artists talk in plate frames.
+    /// The ruler, the frame field and Render Video's file numbers count from it. Files saved
+    /// before it existed open with 0.
+    #[serde(default)]
+    pub start_number: i64,
+    /// Playback loops inside the work area; off, it stops at the work area's last frame. On in
+    /// files saved before it existed (playback always looped).
+    #[serde(default = "loops_by_default")]
+    pub loop_playback: bool,
+}
+
+/// Largest `start_number` either way: far beyond any frame number, small enough that
+/// `start_number + frame` never overflows.
+pub const MAX_START_NUMBER: i64 = 1_000_000_000;
+
+fn loops_by_default() -> bool {
+    true
 }
 
 impl Timeline {
     pub fn new(duration: usize, fps: f32) -> Self {
         let d = duration.max(1);
-        Timeline { fps: valid_fps(fps), duration: d, current: 0, work_start: 0, work_end: d }
+        Timeline { fps: valid_fps(fps), duration: d, current: 0, work_start: 0, work_end: d, start_number: 0, loop_playback: true }
     }
 
     /// Keep every index inside `0..duration` and the work area non-empty.
@@ -85,6 +102,32 @@ impl Timeline {
         self.current = self.current.min(self.duration - 1);
         self.work_start = self.work_start.min(self.duration - 1);
         self.work_end = self.work_end.clamp(self.work_start + 1, self.duration);
+        self.start_number = self.start_number.clamp(-MAX_START_NUMBER, MAX_START_NUMBER);
+    }
+
+    /// The frame number shown for timeline frame `frame` (`start_number + frame`).
+    pub fn number(&self, frame: usize) -> i64 {
+        self.start_number.saturating_add(i64::try_from(frame).unwrap_or(i64::MAX))
+    }
+
+    /// The timeline frame showing frame number `number`, kept inside the timeline.
+    pub fn frame_of(&self, number: i64) -> usize {
+        let index = number.saturating_sub(self.start_number).max(0);
+        usize::try_from(index).unwrap_or(usize::MAX).min(self.duration.saturating_sub(1))
+    }
+
+    /// The work area as timeline frames, `work_start..work_end`, kept inside the timeline and
+    /// never empty, whatever was stored.
+    pub fn work_frames(&self) -> std::ops::Range<usize> {
+        let d = self.duration.max(1);
+        let start = self.work_start.min(d - 1);
+        start..self.work_end.clamp(start + 1, d)
+    }
+
+    /// The work area covers the whole timeline again.
+    pub fn reset_work_area(&mut self) {
+        self.work_start = 0;
+        self.work_end = self.duration.max(1);
     }
 
     /// Move the playhead `delta` frames, stopping at the first and last frame. Saturating, so it's
@@ -136,7 +179,7 @@ mod tests {
         t.step(i64::MIN);
         assert_eq!(t.current, 0);
         for duration in [0, usize::MAX] {
-            let mut t = Timeline { fps: f32::INFINITY, duration, current: usize::MAX, work_start: 0, work_end: 0 };
+            let mut t = Timeline { fps: f32::INFINITY, duration, current: usize::MAX, work_start: 0, work_end: 0, start_number: i64::MIN, loop_playback: true };
             t.step(1);
             assert_eq!(t.current, duration.saturating_sub(1));
             t.clamp();
@@ -147,8 +190,38 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let t = Timeline::new(48, 25.0);
+        let mut t = Timeline::new(48, 25.0);
         let j = serde_json::to_string(&t).unwrap();
         assert_eq!(serde_json::from_str::<Timeline>(&j).unwrap(), t);
+        t.start_number = 1001;
+        t.loop_playback = false;
+        let j = serde_json::to_string(&t).unwrap();
+        assert_eq!(serde_json::from_str::<Timeline>(&j).unwrap(), t);
+    }
+
+    /// A timeline saved before plate numbers and the loop switch counts from 0 and loops.
+    #[test]
+    fn older_timelines_count_from_zero_and_loop() {
+        let t: Timeline = serde_json::from_str(r#"{"fps":24.0,"duration":28,"current":3,"work_start":0,"work_end":28}"#).unwrap();
+        assert_eq!((t.start_number, t.loop_playback), (0, true));
+    }
+
+    #[test]
+    fn frame_numbers_count_from_the_start_number() {
+        let mut t = Timeline::new(28, 24.0);
+        t.start_number = 1001;
+        assert_eq!((t.number(0), t.number(12), t.number(27)), (1001, 1013, 1028));
+        assert_eq!((t.frame_of(1020), t.frame_of(1001)), (19, 0));
+        assert_eq!((t.frame_of(5), t.frame_of(9999)), (0, 27), "numbers outside the timeline land on its ends");
+        t.work_start = 8;
+        t.work_end = 25;
+        assert_eq!(t.work_frames(), 8..25);
+        t.reset_work_area();
+        assert_eq!(t.work_frames(), 0..28);
+        t.start_number = i64::MAX;
+        t.clamp();
+        assert_eq!(t.start_number, MAX_START_NUMBER);
+        t.start_number = 0;
+        assert_eq!(t.number(usize::MAX), i64::MAX, "saturates");
     }
 }

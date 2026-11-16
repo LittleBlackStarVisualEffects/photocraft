@@ -185,10 +185,13 @@ pub fn held_tool(app: &PhotocraftApp, ctx: &egui::Context) -> Option<Temporary> 
     let mut cmd_move = false;
     let mut alt = false;
     let mut hand = None;
+    // Window › Timeline's shortcut keys take a bare Space for Play/Pause.
+    let space_plays = crate::timeline_ui::keys_active(app, ctx);
     ctx.input(|i| {
         for t in Temporary::BOUND {
             if let Some(sc) = binding(app, t)
                 && held(i, &sc)
+                && !(space_plays && sc.logical_key == egui::Key::Space && sc.modifiers.is_none())
                 && best.is_none_or(|(n, ..)| count(&sc) > n)
             {
                 best = Some((count(&sc), t, sc));

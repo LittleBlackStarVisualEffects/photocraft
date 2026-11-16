@@ -623,6 +623,11 @@ fn handle_modal_canvas_keys(app: &mut PhotocraftApp, ctx: &egui::Context, focus:
     if focus == Focus::None && crate::frame_tool::keys(app, ctx) {
         return true;
     }
+    // Window › Timeline's shortcut keys (on in its panel menu, as in Photoshop): Space plays,
+    // the arrows step frames, Home and End go to the ends, ahead of the Move tool's nudge.
+    if focus == Focus::None && crate::timeline_ui::keys(app, ctx) {
+        return true;
+    }
     // Move tool / Free Transform: arrows nudge (⇧ ×10, ⌥ duplicates first).
     if focus == Focus::None && crate::move_mods::arrow_keys(app, ctx) {
         return true;

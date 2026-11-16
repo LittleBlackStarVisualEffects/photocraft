@@ -123,7 +123,8 @@ fn execute_command(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRe
             let previous = std::mem::replace(&mut app.programmatic_playback, true);
             let result = app.run(id, params);
             app.programmatic_playback = previous;
-            result
+            // The engine holds the timeline; the Timeline panel plays it.
+            result.map(|reply| if id.starts_with("timeline.") { crate::timeline_ui::with_playing(app, reply) } else { reply })
         });
     }
     run_waiting(app, wait, |app| crate::menus::invoke(app, ctx, id, params))

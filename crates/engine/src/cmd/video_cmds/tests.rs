@@ -874,6 +874,86 @@ fn restoring_blank_video_frames_still_produces_blank_frames() {
     assert_eq!(layer_px(&s, id)[3], 0.0);
 }
 
+/// `timeline.info` lists each video layer as a track with the frames Restore Frame would change:
+/// painted frames, the one at the playhead included before it's stored back in its frame.
+#[test]
+fn timeline_info_reports_each_video_track_and_its_painted_frames() {
+    let dir = tmpdir("tracks-altered");
+    for i in 0..4 {
+        write_png(&format!("{dir}/f{i}.png"), 8, 8, "#808080");
+    }
+    let mut s = session();
+    let plate = s.execute("layer.videoLayers.newVideoLayerFromFile", json!({"path": dir})).unwrap()["layer"].as_u64().unwrap();
+    let track = |s: &mut Session, id: u64| {
+        let r = s.execute("timeline.info", json!({})).unwrap();
+        r["timeline"]["tracks"].as_array().unwrap().iter().find(|t| t["layerId"] == id).cloned().unwrap_or_else(|| panic!("no track {id}: {r}"))
+    };
+    let t = track(&mut s, plate);
+    assert_eq!((t["frames"].as_u64(), t["start"].as_u64(), t["visible"].as_bool()), (Some(4), Some(0), Some(true)), "{t}");
+    assert_eq!(t["altered"], json!([]), "untouched footage");
+
+    s.execute("timeline.setFrame", json!({"frame": 1})).unwrap();
+    s.execute("edit.fill", json!({"color": "#0000ff"})).unwrap();
+    assert_eq!(track(&mut s, plate)["altered"], json!([1]), "paint at the playhead counts before it is stored");
+    s.execute("timeline.setFrame", json!({"frame": 3})).unwrap();
+    s.execute("edit.fill", json!({"color": "#0000ff"})).unwrap();
+    assert_eq!(track(&mut s, plate)["altered"], json!([1, 3]));
+    s.execute("timeline.setFrame", json!({"frame": 1})).unwrap();
+    s.execute("layer.videoLayers.restoreFrame", json!({})).unwrap();
+    assert_eq!(track(&mut s, plate)["altered"], json!([3]), "Restore Frame removes the frame's paint");
+
+    // A blank video layer: its painted frames.
+    let blank = s.execute("layer.videoLayers.newBlankVideoLayer", json!({})).unwrap()["layer"].as_u64().unwrap();
+    assert_eq!(track(&mut s, blank)["altered"], json!([]));
+    s.execute("edit.fill", json!({"color": "#00ff00"})).unwrap();
+    assert_eq!(track(&mut s, blank)["altered"], json!([1]));
+    let r = s.execute("timeline.info", json!({})).unwrap();
+    let ids: Vec<u64> = r["timeline"]["tracks"].as_array().unwrap().iter().filter_map(|t| t["layerId"].as_u64()).collect();
+    assert_eq!(ids, [blank, plate], "top layer first");
+    // Navigation replies leave the tracks out.
+    assert!(s.execute("timeline.nextFrame", json!({})).unwrap()["timeline"].get("tracks").is_none());
+}
+
+#[test]
+fn render_video_writes_the_work_area_numbered_from_the_start_number() {
+    let mut s = session();
+    s.execute("timeline.create", json!({"duration": 28, "fps": 24})).unwrap();
+    s.execute("timeline.setProps", json!({"startNumber": 1001, "workStart": 8, "workEnd": 25})).unwrap();
+    let render = |s: &Session, p: Value| {
+        let mut names = Vec::new();
+        let r = render_video_with(
+            s,
+            &p,
+            |name, _| {
+                names.push(name.to_string());
+                Ok(())
+            },
+            |_, _| true,
+        );
+        r.map(|r| (r, names))
+    };
+    let (r, names) = render(&s, json!({"format": "png"})).unwrap();
+    assert_eq!((r["frames"].as_u64(), r["first"].as_i64(), r["last"].as_i64()), (Some(17), Some(1009), Some(1025)), "{r}");
+    assert!(names[0].ends_with("_1009.png") && names[16].ends_with("_1025.png"), "{names:?}");
+    let (r, names) = render(&s, json!({"format": "png", "range": "all"})).unwrap();
+    assert_eq!((r["frames"].as_u64(), names.len()), (Some(28), 28));
+    assert!(names[0].ends_with("_1001.png"), "{names:?}");
+    let (_, names) = render(&s, json!({"format": "png", "from": 1012, "to": 1014, "name": "out/plate.####"})).unwrap();
+    assert_eq!(names, ["plate.1012.png", "plate.1013.png", "plate.1014.png"], "the name is a file name, not a path");
+    for p in [json!({"range": "shot"}), json!({"from": 1020, "to": 1010}), json!({"from": "1012"})] {
+        assert!(matches!(render(&s, p.clone()), Err(EngineError::BadParams { .. })), "{p}");
+    }
+}
+
+#[test]
+fn frame_file_names_pad_the_last_hash_run() {
+    assert_eq!(frame_file_name("plate.####", 1009, "exr"), "plate.1009.exr");
+    assert_eq!(frame_file_name("x##y", 3, "png"), "x03y.png");
+    assert_eq!(frame_file_name("shot_#", 1001, "png"), "shot_1001.png", "a short run never cuts the number");
+    assert_eq!(frame_file_name("clip", 12, "jpg"), "clip_0012.jpg");
+    assert_eq!(frame_file_name("clip", -3, "png"), "clip_-003.png");
+}
+
 fn work_area(s: &Session) -> (usize, usize, usize) {
     let t = s.active().unwrap().doc.timeline.as_ref().unwrap();
     (t.work_start, t.work_end, t.duration)

@@ -49,7 +49,7 @@ pub use variables::{DataSet, DataValue, PixelAlign, PixelMethod, VarKind, Variab
 pub use vector::{
     ClippingPath, FillRule, Knot, LineCap, LineJoin, LiveShape, NamedPath, Path, PathOp, ShapeLayer, ShapeStroke, StrokeAlign, Subpath, VectorMask,
 };
-pub use video::{Timeline, VideoData, VideoSource};
+pub use video::{MAX_START_NUMBER, Timeline, VideoData, VideoSource};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 

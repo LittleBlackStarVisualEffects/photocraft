@@ -821,7 +821,13 @@ fn video_layer_frames_survive_roundtrip() {
     use photocraft_doc::{Timeline, VideoData, VideoSource};
     use photocraft_geom::Rect;
     let mut doc = Document::new("Vid", photocraft_geom::Size { width: 8, height: 6 }, ColorMode::Rgb, SampleType::U8);
-    doc.timeline = Some(Timeline::new(3, 24.0));
+    let mut timeline = Timeline::new(3, 24.0);
+    // Plate numbers, a narrowed work area and Loop Playback off are kept too.
+    timeline.start_number = 1001;
+    timeline.work_start = 1;
+    timeline.work_end = 2;
+    timeline.loop_playback = false;
+    doc.timeline = Some(timeline.clone());
     let fmt = doc.pixel_format();
     let mut l = Layer::raster("Clip", fmt);
     let mut frames = Vec::new();
@@ -847,7 +853,12 @@ fn video_layer_frames_survive_roundtrip() {
     assert_eq!(v.fps, 24.0);
     assert!(!v.show_altered);
     assert_eq!(v.source, VideoSource::File { path: "/tmp/seq".into() });
-    assert_eq!(back.timeline.as_ref().unwrap().duration, 3);
+    assert_eq!(back.timeline.as_ref(), Some(&timeline));
+    // Unpainted frames share their footage's tiles again, so finding painted frames
+    // (`timeline.info` tracks) stays a pointer comparison after a reopen.
+    for (frame, original) in v.frames.iter().zip(v.original_frames.as_ref().unwrap()) {
+        assert!(frame.tiles().zip(original.tiles()).all(|((_, a), (_, b))| std::sync::Arc::ptr_eq(a, b)));
+    }
     // A middle frame's pixel survived.
     let mut px = [[0.0f32; 4]; 1];
     v.frames[2].read_rgba_into(Rect::from_xywh(1, 1, 1, 1), &mut px);

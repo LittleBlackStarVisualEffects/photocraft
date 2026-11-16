@@ -2542,3 +2542,24 @@ fn shift_right_menu_choose_rejects_bad_choices_and_sets_the_tool() {
     shift_right(&mut app, &ctx, "magicEraser");
     assert!(inspect(&app, &ctx)["brushModeMenu"].is_null());
 }
+
+/// `timeline.info` over `engine.execute` carries the panel's `playing` with the engine's timeline,
+/// and the plate numbering (`startNumber`, `setFrame {number}`) works over the channel.
+#[test]
+fn timeline_info_reports_playing_and_plate_numbers() {
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+    let ctx = egui::Context::default();
+    app.run("file.new", json!({"width": 8, "height": 8})).unwrap();
+    app.run("timeline.create", json!({"duration": 28, "fps": 24.0})).unwrap();
+    let r = call(&mut app, &ctx, "engine.execute", json!({"command": "timeline.setProps", "params": {"startNumber": 1001}}));
+    assert_eq!(r["result"]["timeline"]["startNumber"], 1001, "{r}");
+    let r = call(&mut app, &ctx, "engine.execute", json!({"command": "timeline.setFrame", "params": {"number": 1020}}));
+    assert_eq!(r["result"]["timeline"]["current"], 19, "{r}");
+    call(&mut app, &ctx, "timeline.play", json!({}));
+    let r = call(&mut app, &ctx, "engine.execute", json!({"command": "timeline.info"}));
+    let t = &r["result"]["timeline"];
+    assert_eq!((t["playing"].as_bool(), t["startNumber"].as_i64(), t["loop"].as_bool()), (Some(true), Some(1001), Some(true)), "{r}");
+    assert!(t["tracks"].is_array(), "{r}");
+    let r = call(&mut app, &ctx, "engine.execute", json!({"command": "timeline.setProps", "params": {"startFrame": 1}}));
+    assert!(r["error"].as_str().unwrap_or_default().contains("startFrame"), "{r}");
+}

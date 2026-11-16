@@ -6,8 +6,9 @@ use super::{BTreeMap, Map, PhotocraftApp, RichText, Tokens, Value, default_short
 pub fn shortcut_items(app: &PhotocraftApp) -> Vec<(String, String, Vec<String>, Option<String>)> {
     let mut out: Vec<(String, String, Vec<String>, Option<String>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let timeline = |id: &str| crate::timeline_ui::SHORTCUT_COMMANDS.iter().any(|c| c.0 == id);
     for it in crate::menus::menu_items(app) {
-        if it.label == "---" || !seen.insert(it.id.clone()) {
+        if it.label == "---" || timeline(&it.id) || !seen.insert(it.id.clone()) {
             continue;
         }
         let default = default_shortcut(&it.id).or(it.shortcut.clone().filter(|_| !app.session.prefs().shortcuts.contains_key(&it.id)));
@@ -20,6 +21,9 @@ pub fn shortcut_items(app: &PhotocraftApp) -> Vec<(String, String, Vec<String>, 
     let mut tools = Vec::new();
     let mut layer = Vec::new();
     for c in photocraft_engine::command_specs() {
+        if timeline(c.id) {
+            continue;
+        }
         if seen.insert(c.id.to_string()) && c.shortcut.is_some() {
             let item = (c.id.to_string(), c.label.to_string(), c.menu.iter().map(|s| s.to_string()).collect::<Vec<_>>(), c.shortcut.map(Into::into));
             if c.menu.is_empty() && tools_key(c.id) {
@@ -35,6 +39,14 @@ pub fn shortcut_items(app: &PhotocraftApp) -> Vec<(String, String, Vec<String>, 
     }
     let at = out.iter().rposition(|i| i.2.first().map(String::as_str) == Some("Layer")).map_or(out.len(), |i| i + 1);
     out.splice(at..at, layer);
+    // Window › Timeline's commands, as Photoshop lists its Timeline panel's: no keys of their own
+    // (Enable Timeline Shortcut Keys gives the panel Space, the arrows, Home and End), any can be
+    // bound here.
+    for (id, label) in crate::timeline_ui::SHORTCUT_COMMANDS {
+        if seen.insert(id.to_string()) {
+            out.push((id.to_string(), label.to_string(), vec!["Timeline".to_string()], default_shortcut(id)));
+        }
+    }
     out.extend(tools);
     out.extend(
         crate::state::Tool::ALL

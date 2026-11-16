@@ -596,6 +596,10 @@ fn invoke_export_command(app: &mut PhotocraftApp, id: &str, params: &Value) -> R
                 if !render_params.contains_key("format") {
                     render_params.insert("format".into(), json!(app.ui.timeline.render_format.ext()));
                 }
+                // And its range (the work area by default), unless the caller names frames.
+                if !["range", "from", "to"].iter().any(|k| render_params.contains_key(*k)) {
+                    render_params.insert("range".into(), json!(app.ui.timeline.render_range.param()));
+                }
                 Some(app.ask_folder(move |app, dir| {
                     render_params.insert("dir".into(), json!(dir));
                     app.with_document(document, |app| app.run("file.export.renderVideo", Value::Object(render_params)))

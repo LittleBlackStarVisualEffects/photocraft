@@ -998,8 +998,59 @@ fn safe_stem(name: &str) -> String {
     if stem.is_empty() || stem.chars().all(|c| c == '.') { "video".to_string() } else { stem.to_string() }
 }
 
-/// Export › Render Video: composite the whole document at each timeline frame and write an image
-/// sequence (`{dir}/{stem}_NNNN.{format}`). Clean-room; no proprietary codec.
+/// The frames Render Video writes and the first one's number: the work area (`range`
+/// `"workArea"`, the default), every frame (`"all"`), or `from`..=`to`, frame numbers counted from
+/// the timeline's `startNumber`. A document without a timeline renders its one frame.
+fn render_frames(t: Option<&Timeline>, p: &Value) -> Result<std::ops::Range<usize>> {
+    let cmd = "file.export.renderVideo";
+    let bad = |msg: String| EngineError::BadParams { cmd: cmd.into(), msg };
+    let Some(t) = t else { return Ok(0..1) };
+    let mut frames = match p.get("range").filter(|v| !v.is_null()) {
+        None => t.work_frames(),
+        Some(v) => match v.as_str() {
+            Some("workArea") => t.work_frames(),
+            Some("all") => 0..t.duration.max(1),
+            _ => return Err(bad(format!("`range` must be \"workArea\" or \"all\" (or give `from` and `to`), got {v}"))),
+        },
+    };
+    let number = |key: &str| -> Result<Option<i64>> {
+        match p.get(key).filter(|v| !v.is_null()) {
+            None => Ok(None),
+            Some(v) => v.as_i64().map(Some).ok_or_else(|| bad(format!("`{key}` must be a whole frame number, got {v}"))),
+        }
+    };
+    if let Some(from) = number("from")? {
+        frames.start = t.frame_of(from);
+    }
+    if let Some(to) = number("to")? {
+        frames.end = t.frame_of(to) + 1;
+    }
+    if frames.start >= frames.end {
+        return Err(bad(format!("`from` {} comes after `to` {}", t.number(frames.start), t.number(frames.end.saturating_sub(1)))));
+    }
+    Ok(frames)
+}
+
+/// A rendered frame's file name: `pattern` with its last run of `#` replaced by `number`, padded
+/// with zeros to the run's length (`plate.####` → `plate.1009`), then `.{format}`. A pattern
+/// without `#` gets `_####` added.
+fn frame_file_name(pattern: &str, number: i64, format: &str) -> String {
+    let (head, run, tail) = match pattern.rfind('#') {
+        Some(last) => {
+            let first = pattern[..=last].trim_end_matches('#').len();
+            (&pattern[..first], last + 1 - first, &pattern[last + 1..])
+        }
+        None => (pattern, 0, ""),
+    };
+    if run == 0 {
+        return format!("{head}_{number:04}.{format}");
+    }
+    format!("{head}{number:0run$}{tail}.{format}")
+}
+
+/// Export › Render Video: composite the whole document at each frame of the work area (or
+/// `range`, `from`/`to`) and write an image sequence numbered from the timeline's `startNumber`
+/// (`{dir}/{stem}_NNNN.{format}`, or the `name` pattern's `####`). Clean-room; no proprietary codec.
 fn render_video(s: &mut Session, p: &Value) -> Result<Value> {
     let dir = p.get("dir").and_then(Value::as_str).ok_or_else(|| EngineError::BadParams { cmd: "file.export.renderVideo".into(), msg: "need `dir`".into() })?;
     std::fs::create_dir_all(dir).map_err(|e| EngineError::Other(format!("mkdir `{dir}`: {e}")))?;
@@ -1019,15 +1070,22 @@ pub fn render_video_with(
     let st = s.active().ok_or(EngineError::NoDocument)?;
     let mut base = (*st.doc).clone();
     store(&mut base);
-    let frames = base.timeline.as_ref().map_or(1, |t| t.duration).max(1);
+    let range = render_frames(base.timeline.as_ref(), p)?;
+    let frames = range.len();
     // Loaded timelines bypass the duration validation used by timeline.create/setProps.
     if frames > crate::timeline_cmds::MAX_DURATION {
         return Err(EngineError::Other(format!("the timeline is {frames} frames; Render Video is limited to {} frames", crate::timeline_cmds::MAX_DURATION)));
     }
+    let number = |f: usize| base.timeline.as_ref().map_or(0, |t| t.number(f));
     // Only the GIF delay reads the rate (frames come from the duration); rates under 1 fps are
     // valid timelines, so only an unusable loaded rate falls back to 30.
     let fps = base.timeline.as_ref().map(|t| t.fps).filter(|f| f.is_finite() && *f > 0.0).unwrap_or(30.0);
     let stem = safe_stem(&base.name);
+    // A `name` pattern is a file name, never a path: only its last component is used.
+    let pattern = match p.get("name").and_then(Value::as_str).map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n).trim()) {
+        Some(n) if !n.is_empty() && !n.chars().all(|c| c == '.') => n.to_string(),
+        _ => format!("{stem}_####"),
+    };
     let fmt = base.pixel_format();
     let bounds = base.bounds();
     let (w, h) = (bounds.width() as usize, bounds.height() as usize);
@@ -1044,7 +1102,7 @@ pub fn render_video_with(
         check_gif_budget(w as u64, h as u64, frames as u64).map_err(EngineError::Other)?;
         let delay = (100.0 / fps).round().clamp(1.0, 65535.0) as u16;
         let mut gframes = Vec::with_capacity(frames);
-        for f in 0..frames {
+        for (done, f) in range.clone().enumerate() {
             let mut doc = base.clone();
             if let Some(t) = &mut doc.timeline {
                 t.current = f;
@@ -1055,7 +1113,7 @@ pub fn render_video_with(
             surf.read_rgba_into(bounds, &mut px);
             gframes.push(gif_frame(px, w, delay)?);
             // The final report follows encoding/writing, so total means the output exists.
-            if !progress((f + 1).min(frames.saturating_sub(1)), frames) {
+            if !progress((done + 1).min(frames.saturating_sub(1)), frames) {
                 return Err(cancelled());
             }
         }
@@ -1073,21 +1131,22 @@ pub fn render_video_with(
     // PSD / PSB frames would embed the files linked smart objects name: not for a restricted session.
     let opts = photocraft_io::ExportOptions { read_linked_files: s.authorize.is_none(), ..Default::default() };
     let mut files = Vec::new();
-    for f in 0..frames {
+    for (done, f) in range.clone().enumerate() {
         let mut doc = base.clone();
         if let Some(t) = &mut doc.timeline {
             t.current = f;
         }
         sync(&mut doc);
-        let path = format!("{stem}_{f:04}.{format}");
-        let bytes = photocraft_io::export(&doc, format, &opts).map(|r| r.bytes).map_err(|e| EngineError::Other(format!("render frame {f}: {e}")))?;
+        let n = number(f);
+        let path = frame_file_name(&pattern, n, format);
+        let bytes = photocraft_io::export(&doc, format, &opts).map(|r| r.bytes).map_err(|e| EngineError::Other(format!("render frame {n}: {e}")))?;
         write(&path, &bytes)?;
         files.push(path);
-        if !progress(f + 1, frames) {
+        if !progress(done + 1, frames) {
             return Err(cancelled());
         }
     }
-    Ok(json!({"frames": files.len(), "dir": dir}))
+    Ok(json!({"frames": files.len(), "dir": dir, "first": number(range.start), "last": number(range.end - 1)}))
 }
 
 /// One animated GIF frame from straight RGBA pixels, as Save for Web's GIF does (#3061): pixels
@@ -1132,7 +1191,16 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("layer.videoLayers.interpretFootage", "Interpret Footage…", vl, active_video, |s, p| interpret_footage(s, p)),
         spec!("layer.videoLayers.reloadFrame", "Reload Frame", vl, active_video, |s, p| reload_frame(s, p)),
         spec!("file.import.videoFramesToLayers", "Video Frames to Layers…", &["File", "Import"], has_doc, |s, p| frames_to_layers(s, p)),
-        spec!("file.export.renderVideo", "Render Video…", &["File", "Export"], has_doc, |s, p| render_video(s, p)),
+        CommandSpec {
+            id: "file.export.renderVideo",
+            label: "Render Video…",
+            menu: &["File", "Export"],
+            shortcut: None,
+            params: r#"{dir, format?:"png", range?:"workArea"|"all", from?:frameNumber, to?:frameNumber, name?:"plate.####"} → {frames, dir, first, last}"#,
+            enabled: has_doc,
+            journal: true,
+            run: |s, p| render_video(s, p),
+        },
     ]
 }
 

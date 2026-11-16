@@ -309,6 +309,10 @@ impl PhotocraftApp {
         if chrome && self.ui.panels.status_bar && !home {
             panels::status_bar(self, ui);
         }
+        // Window › Timeline docked full width along the bottom, above the status bar.
+        if chrome && !home {
+            timeline_ui::dock(self, ui);
+        }
         let toolbar_shown = ((chrome && self.ui.panels.toolbar) || tabbed_in) && !home;
         // craft-ui's layout holds the canvas as its protected `canvas` panel.
         let docking = ((chrome && self.ui.panels.dock) || tabbed_in) && !home;
